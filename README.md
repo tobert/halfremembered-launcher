@@ -272,9 +272,6 @@ You can use the `push` command to deploy the launcher binary to a new machine.
 
 ## About This Project
 
-HalfRemembered Launcher was collaboratively developed by **Amy Tobey** and **Claude Code** (Anthropic's AI coding
-assistant). This project demonstrates how human creativity and AI capabilities can combine to build sophisticated
-systems that solve real-world problems.
+HalfRemembered Launcher was collaboratively developed by **Amy Tobey**, **Claude Code** (Anthropic's AI coding assistant), and **Gemini** (Google's AI coding assistant). This project demonstrates how human creativity and AI capabilities can combine to scratch an itch. This all could have been a shell script but Amy had agents write most of the code as an experiment in shell script harm reduction and trying some bot-driven OSS.
 
-For developers interested in the architecture, implementation details, and contributing guidelines, see
-[BOTS.md](BOTS.md).
+Agent contributors must read [BOTS.md](BOTS.md).
