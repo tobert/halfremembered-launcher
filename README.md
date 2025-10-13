@@ -29,7 +29,7 @@ Open a terminal and run the server. It will listen for clients on the default po
 Open a second terminal in the same directory. Run the client and enable info-level logging to see it connect.
 
 ```bash
-RUST_LOG=info ./target/release/halfremembered-launcher client localhost
+./target/release/halfremembered-launcher client localhost
 ```
 
 > **What to Expect**: You should see log messages from the client confirming it has registered with the server, followed by periodic heartbeats. This indicates a successful connection.
