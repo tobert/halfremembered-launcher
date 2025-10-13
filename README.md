@@ -6,21 +6,43 @@ IPs while maintaining SSH security.
 
 ## Quick Start
 
-Build, start the server, start a client, all on localhost.
+Get up and running in four steps. This guide assumes your SSH agent is running and has keys loaded (`ssh-add -l`).
+
+**1. Build the Project**
+
+First, compile the project in release mode.
 
 ```bash
-# 1. Build the project
 cargo build --release
-
-# 2. Terminal 1: Start the server
-./target/release/halfremembered-launcher server --port 20222
-
-# 3. Terminal 2: Start a client (connects to localhost)
-RUST_LOG=info ./target/release/halfremembered-launcher client $USER@localhost --port 20222
 ```
 
-You should see client registration, heartbeats every 30 seconds, and persistent connection maintenance. Press Ctrl+C
-to stop.
+**2. Start the Server**
+
+Open a terminal and run the server. It will listen for clients on the default port (20222).
+
+```bash
+./target/release/halfremembered-launcher server
+```
+
+**3. Connect a Client**
+
+Open a second terminal in the same directory. Run the client and enable info-level logging to see it connect.
+
+```bash
+RUST_LOG=info ./target/release/halfremembered-launcher client localhost
+```
+
+> **What to Expect**: You should see log messages from the client confirming it has registered with the server, followed by periodic heartbeats. This indicates a successful connection.
+
+**4. Sync a File**
+
+In a third terminal, use the `sync` command to transfer a file to the connected client. Let's sync the `Cargo.toml` file as an example. Note that management commands also need the server address.
+
+```bash
+./target/release/halfremembered-launcher sync Cargo.toml --destination /tmp/Cargo.toml --server localhost
+```
+
+To verify, you can check the contents of `/tmp/Cargo.toml` on the client machine. You've just synced your first file! For more advanced options, see the **Usage** section below.
 
 ## Architecture Overview
 
@@ -80,7 +102,7 @@ graph LR
 
 ### Prerequisites
 
-- Rust 1.70+ (`rustup` recommended)
+- Rust 1.85+ (`rustup` recommended)
 - SSH agent with at least one key loaded (`ssh-add`)
 - Ed25519 key recommended
 
@@ -177,57 +199,68 @@ $env:RUST_LOG="debug"; .\halfremembered-launcher.exe client user@server
 
 ### Start the Server
 
+Run the server daemon on a publicly accessible machine.
+
 ```bash
-# Start server daemon on port 20222
-halfremembered-launcher server --port 20222
+# Start on the default port (20222)
+./target/release/halfremembered-launcher server
+
+# Start on a custom port
+./target/release/halfremembered-launcher server --port 1337
 ```
 
 ### Start a Client
 
-```bash
-# Connect to server (client daemon maintains persistent connection)
-halfremembered-launcher client user@buildserver --port 20222
+The client connects to the server and waits for commands. The `<SERVER>` argument can be a simple hostname or a full `user@host:port` string.
 
-# With custom heartbeat and reconnect intervals
-halfremembered-launcher client user@buildserver \
-    --heartbeat 30 \
-    --reconnect 5
+```bash
+# Connect to a server on the same machine
+./target/release/halfremembered-launcher client localhost
+
+# Connect to a remote server with a specific user
+./target/release/halfremembered-launcher client alice@example.com
+
+# Connect to a remote server with a custom port
+./target/release/halfremembered-launcher client bob@dev-server.local:1337
+
+# Connect with custom heartbeat and reconnect intervals
+./target/release/halfremembered-launcher client server.example.com --heartbeat 60 --reconnect 10
 ```
 
 ### Server Management Commands
 
+Management commands are sent to the server to control clients. The `--server` argument specifies the server to connect to, and defaults to `$USER@localhost` if not provided.
+
 ```bash
 # List connected clients
-halfremembered-launcher list --server user@localhost --port 20222
+./target/release/halfremembered-launcher list --server user@localhost
 
 # Ping a specific client
-halfremembered-launcher ping laptop01 --server user@localhost --port 20222
+./target/release/halfremembered-launcher ping laptop01 --server user@localhost
 
-# Execute command on a client
-halfremembered-launcher exec laptop01 ./myapp arg1 arg2 \
-    --server user@localhost --port 20222
+# Execute a command on a client
+./target/release/halfremembered-launcher exec laptop01 ./myapp arg1 arg2 --server user@localhost
 
 # Sync a file to all connected clients
-halfremembered-launcher sync /path/to/local/file \
-    --destination /remote/path/file \
-    --server user@localhost --port 20222
+./target/release/halfremembered-launcher sync /path/to/local/file --destination /remote/path/file --server user@localhost
 
 # Get server status
-halfremembered-launcher status --server user@localhost --port 20222
+./target/release/halfremembered-launcher status --server user@localhost
 
 # Shutdown the server
-halfremembered-launcher shutdown --server user@localhost --port 20222
+./target/release/halfremembered-launcher shutdown --server user@localhost
 ```
 
 ### Bootstrap/Deploy
 
+You can use the `push` command to deploy the launcher binary to a new machine.
+
 ```bash
-# Push binary to server and optionally start it
-halfremembered-launcher push user@server \
+# Push binary to a server and start it
+./target/release/halfremembered-launcher push user@server \
     --binary ./target/release/halfremembered-launcher \
     --destination ~/halfremembered-launcher \
-    --start \
-    --port 20222
+    --start
 ```
 
 ## Security

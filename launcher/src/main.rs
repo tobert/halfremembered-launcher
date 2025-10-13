@@ -210,13 +210,14 @@ async fn main() -> Result<()> {
         } => {
             log::info!("Starting HalfRemembered client, connecting to {}", server);
 
-            let (user, host) = parse_connection_string(&server)?;
+            let (user, host, conn_port) = parse_connection_string(&server)?;
+            let final_port = conn_port.unwrap_or(port);
             let hostname = hostname::get()
                 .context("Failed to get hostname")?
                 .to_string_lossy()
                 .to_string();
 
-            let mut daemon = client_daemon::ClientDaemon::new(host, port, user, hostname)
+            let mut daemon = client_daemon::ClientDaemon::new(host, final_port, user, hostname)
                 .with_heartbeat_interval(std::time::Duration::from_secs(heartbeat))
                 .with_reconnect_delay(std::time::Duration::from_secs(reconnect))
                 .with_agent_socket(agent_socket);
@@ -233,14 +234,15 @@ async fn main() -> Result<()> {
             log::info!("Pinging client: {}", hostname);
 
             let server = server.unwrap_or_else(|| format!("{}@localhost", get_default_user().unwrap()));
-            let (user, host) = parse_connection_string(&server)?;
+            let (user, host, conn_port) = parse_connection_string(&server)?;
+            let final_port = conn_port.unwrap_or(port);
             let command = LocalCommand::Ping {
                 target: hostname.clone(),
             };
 
             let response = ssh_client::SshClientConnection::send_control_command(
                 &host,
-                port,
+                final_port,
                 &user,
                 command,
                 agent_socket.as_deref(),
@@ -270,12 +272,13 @@ async fn main() -> Result<()> {
             log::debug!("Listing connected clients");
 
             let server = server.unwrap_or_else(|| format!("{}@localhost", get_default_user().unwrap()));
-            let (user, host) = parse_connection_string(&server)?;
+            let (user, host, conn_port) = parse_connection_string(&server)?;
+            let final_port = conn_port.unwrap_or(port);
             let command = LocalCommand::ListClients;
 
             let response = ssh_client::SshClientConnection::send_control_command(
                 &host,
-                port,
+                final_port,
                 &user,
                 command,
                 agent_socket.as_deref(),
@@ -318,7 +321,8 @@ async fn main() -> Result<()> {
             log::info!("Executing {} on {}", binary, hostname);
 
             let server = server.unwrap_or_else(|| format!("{}@localhost", get_default_user().unwrap()));
-            let (user, host) = parse_connection_string(&server)?;
+            let (user, host, conn_port) = parse_connection_string(&server)?;
+            let final_port = conn_port.unwrap_or(port);
             let command = LocalCommand::Execute {
                 target: hostname.clone(),
                 binary,
@@ -327,7 +331,7 @@ async fn main() -> Result<()> {
 
             let response = ssh_client::SshClientConnection::send_control_command(
                 &host,
-                port,
+                final_port,
                 &user,
                 command,
                 agent_socket.as_deref(),
@@ -359,7 +363,8 @@ async fn main() -> Result<()> {
             log::info!("Syncing {} to all clients", file.display());
 
             let server = server.unwrap_or_else(|| format!("{}@localhost", get_default_user().unwrap()));
-            let (user, host) = parse_connection_string(&server)?;
+            let (user, host, conn_port) = parse_connection_string(&server)?;
+            let final_port = conn_port.unwrap_or(port);
             let dest = destination.unwrap_or_else(|| file.to_string_lossy().to_string());
 
             let command = LocalCommand::SyncFile {
@@ -369,7 +374,7 @@ async fn main() -> Result<()> {
 
             let response = ssh_client::SshClientConnection::send_control_command(
                 &host,
-                port,
+                final_port,
                 &user,
                 command,
                 agent_socket.as_deref(),
@@ -401,7 +406,7 @@ async fn main() -> Result<()> {
         } => {
             log::info!("Pushing {} to {}", binary.display(), server);
 
-            let (user, host) = parse_connection_string(&server)?;
+            let (user, host, _conn_port) = parse_connection_string(&server)?;
 
             // Upload binary via SFTP (uses host sshd on port 22)
             ssh_client::SshClientConnection::upload_file_via_sftp(
@@ -478,12 +483,13 @@ async fn main() -> Result<()> {
             log::debug!("Getting server status");
 
             let server = server.unwrap_or_else(|| format!("{}@localhost", get_default_user().unwrap()));
-            let (user, host) = parse_connection_string(&server)?;
+            let (user, host, conn_port) = parse_connection_string(&server)?;
+            let final_port = conn_port.unwrap_or(port);
             let command = LocalCommand::Status;
 
             let response = ssh_client::SshClientConnection::send_control_command(
                 &host,
-                port,
+                final_port,
                 &user,
                 command,
                 agent_socket.as_deref(),
@@ -513,12 +519,13 @@ async fn main() -> Result<()> {
             log::info!("Shutting down server");
 
             let server = server.unwrap_or_else(|| format!("{}@localhost", get_default_user().unwrap()));
-            let (user, host) = parse_connection_string(&server)?;
+            let (user, host, conn_port) = parse_connection_string(&server)?;
+            let final_port = conn_port.unwrap_or(port);
             let command = LocalCommand::Shutdown;
 
             let response = ssh_client::SshClientConnection::send_control_command(
                 &host,
-                port,
+                final_port,
                 &user,
                 command,
                 agent_socket.as_deref(),
@@ -564,21 +571,21 @@ fn get_default_user() -> Result<String> {
     )
 }
 
-fn parse_connection_string(connection: &str) -> Result<(String, String)> {
+fn parse_connection_string(connection: &str) -> Result<(String, String, Option<u16>)> {
     let parts: Vec<&str> = connection.split('@').collect();
 
-    let (user, host) = match parts.len() {
+    let (user, host, port) = match parts.len() {
         1 => {
             // No '@' found, use default user
             let user = get_default_user()?;
-            let host = parts[0].split(':').next().unwrap().to_string();
-            (user, host)
+            let (host, port) = parse_host_port(parts[0])?;
+            (user, host, port)
         }
         2 => {
             // user@host format
             let user = parts[0].to_string();
-            let host = parts[1].split(':').next().unwrap().to_string();
-            (user, host)
+            let (host, port) = parse_host_port(parts[1])?;
+            (user, host, port)
         }
         _ => {
             anyhow::bail!(
@@ -587,5 +594,22 @@ fn parse_connection_string(connection: &str) -> Result<(String, String)> {
         }
     };
 
-    Ok((user, host))
+    Ok((user, host, port))
+}
+
+fn parse_host_port(host_str: &str) -> Result<(String, Option<u16>)> {
+    let parts: Vec<&str> = host_str.split(':').collect();
+    match parts.len() {
+        1 => Ok((parts[0].to_string(), None)),
+        2 => {
+            let host = parts[0].to_string();
+            let port = parts[1]
+                .parse::<u16>()
+                .context("Invalid port number in connection string")?;
+            Ok((host, Some(port)))
+        }
+        _ => {
+            anyhow::bail!("Invalid host:port format");
+        }
+    }
 }
