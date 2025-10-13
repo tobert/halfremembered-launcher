@@ -546,17 +546,17 @@ async fn main() -> Result<()> {
 
 fn get_default_user() -> Result<String> {
     // Try USER first (Unix/Linux/WSL)
-    if let Ok(user) = std::env::var("USER") {
-        if !user.is_empty() {
-            return Ok(user);
-        }
+    if let Ok(user) = std::env::var("USER")
+        && !user.is_empty()
+    {
+        return Ok(user);
     }
 
     // Fall back to USERNAME (Windows)
-    if let Ok(user) = std::env::var("USERNAME") {
-        if !user.is_empty() {
-            return Ok(user);
-        }
+    if let Ok(user) = std::env::var("USERNAME")
+        && !user.is_empty()
+    {
+        return Ok(user);
     }
 
     anyhow::bail!(

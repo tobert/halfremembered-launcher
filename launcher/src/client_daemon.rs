@@ -264,12 +264,12 @@ impl ClientDaemon {
         let local_path = std::path::PathBuf::from(&relative_path);
 
         // Create parent directory if needed
-        if let Some(parent) = local_path.parent() {
-            if !parent.exists() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .context("Failed to create parent directory")?;
-            }
+        if let Some(parent) = local_path.parent()
+            && !parent.exists()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context("Failed to create parent directory")?;
         }
 
         // Spawn rsync task
