@@ -1,0 +1,48 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock file (optional, but often included for binary projects)
+# Uncomment if you want to exclude it
+# Cargo.lock
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Debug files
+*.dSYM/
+
+# Local configuration and runtime files
+~/.halfremembered-launcher/
+*.log
+
+# Test output
+test-output/
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Integration test artifacts
+integration.sh.output
+
+# Environment files (in case they're added later)
+.env
+.env.local
+
+# SSH keys (should never be committed)
+*.key
+*.pem
+id_rsa*
+id_ed25519*
+
+# Binary executables (if copied to root)
+halfremembered-launcher
+halfremembered-launcher.exe
