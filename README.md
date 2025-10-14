@@ -52,24 +52,25 @@ The launcher uses persistent SSH connections with multiplexed channels for bidir
 graph LR
     subgraph Client["Client Machine"]
         CP[Client Master Process]
-        MS[Master Session<br/>- Control Chan<br/>- Data Channels<br/>- Heartbeat]
+        MS[Master Session<br/>- Control Chan<br/>- Rsync Chan<br/>- SFTP Chan<br/>- Heartbeat]
         CP --> MS
     end
 
     subgraph Server["Server Machine"]
         SD[Server Daemon]
-        CH[Client Handler<br/>- Control Loop<br/>- File Server<br/>- Exec Handler]
+        CH[Client Handler<br/>- Control Loop<br/>- Rsync Engine<br/>- File Server<br/>- Exec Handler]
         CR[Client Registry]
         SD --> CH
         SD --> CR
     end
 
-    MS <-->|SSH Connection<br/>Port 20222| CH
+    MS <-->|SSH Connection<br/>Port 20222<br/>Multiplexed| CH
 ```
 
 ### Key Features
 
 - **Persistent SSH Connections**: Single authenticated connection per client, multiplexed for all operations
+- **Efficient Delta Sync**: Built-in rsync algorithm transfers only changed blocks, minimizing bandwidth
 - **Server Push**: Server can initiate file transfers and commands to connected clients
 - **NAT/Firewall Friendly**: Clients establish outbound connections only
 - **User Context**: Client runs in user environment with full access to graphics, audio, etc.
@@ -84,16 +85,18 @@ graph LR
 3. **Registers capabilities** and hostname with server
 4. **Maintains persistent connection** with heartbeats
 5. **Server pushes commands** through control channel using bincode protocol:
-   - File sync operations (via SFTP)
+   - File sync operations (rsync delta algorithm over dedicated channel)
    - Binary execution requests
    - Status queries
 6. **Client multiplexes operations** over single SSH connection
+7. **Efficient transfers**: Rsync engine calculates signatures and transfers only changed blocks
 
 ### Technical Details
 
 - **Server**: Pure Rust SSH server (`russh`) on port 20222 with ephemeral Ed25519 keys
 - **Client**: Pure Rust SSH client (`russh`) with ssh-agent authentication only
 - **Wire Protocol**: Length-prefixed bincode (compact binary, ~3x smaller than JSON)
+- **File Transfer**: Rsync algorithm (`fast_rsync` crate) for efficient delta synchronization
 - **Authorization**: Server reads `~/.ssh/authorized_keys` for authorized keys
 - **Configuration**: CLI flags with sensible defaults (everything configurable)
 - **Async Runtime**: Tokio for all I/O operations (client and server)
