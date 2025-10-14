@@ -51,20 +51,20 @@ The launcher uses persistent SSH connections with multiplexed channels for bidir
 ```mermaid
 graph LR
     subgraph Client["Client Machine"]
-        CP[Client Master Process]
-        MS[Master Session<br/>- Control Chan<br/>- Rsync Chan<br/>- Heartbeat]
-        CP --> MS
+        CD[Client Daemon<br/>Control Loop]
+        SC[SSH Client<br/>russh]
+        CD --> SC
     end
 
-    subgraph Server["Server Machine"]
-        SD[Server Daemon]
-        CH[Client Handler<br/>- Control Loop<br/>- Rsync Engine<br/>- File Server<br/>- Exec Handler]
+    subgraph Server["Server Machine (Port 20222)"]
+        SS[SSH Server<br/>russh]
+        CH[Session Handler<br/>- Rsync Engine<br/>- Exec Handler]
         CR[Client Registry]
-        SD --> CH
-        SD --> CR
+        SS --> CH
+        SS --> CR
     end
 
-    MS <-->|SSH Connection<br/>Port 20222<br/>Multiplexed| CH
+    SC <-->|Multiplexed Channels<br/>- Control<br/>- Rsync<br/>- Heartbeat| SS
 ```
 
 ### Key Features
