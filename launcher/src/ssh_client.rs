@@ -25,11 +25,7 @@ pub struct SshClientConnection {
     message_buffer: Arc<Mutex<MessageBuffer>>,
 }
 
-pub struct ClientHandler {
-    /// TODO: Buffer for handling complex SSH events beyond simple data.
-    #[allow(dead_code)]
-    message_buffer: Arc<Mutex<MessageBuffer>>,
-}
+pub struct ClientHandler;
 
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
@@ -88,9 +84,7 @@ impl SshClientConnection {
         let config = Arc::new(config);
         let message_buffer = Arc::new(Mutex::new(MessageBuffer::new()));
 
-        let handler = ClientHandler {
-            message_buffer: message_buffer.clone(),
-        };
+        let handler = ClientHandler;
 
         let mut session = client::connect(config, (host, port), handler).await?;
 
@@ -259,11 +253,8 @@ impl SshClientConnection {
         };
 
         let config = Arc::new(config);
-        let message_buffer = Arc::new(Mutex::new(MessageBuffer::new()));
 
-        let handler = ClientHandler {
-            message_buffer: message_buffer.clone(),
-        };
+        let handler = ClientHandler;
 
         let mut session = client::connect(config, (host, port), handler)
             .await
@@ -363,11 +354,8 @@ impl SshClientConnection {
         };
 
         let config = Arc::new(config);
-        let message_buffer = Arc::new(Mutex::new(MessageBuffer::new()));
 
-        let handler = ClientHandler {
-            message_buffer: message_buffer.clone(),
-        };
+        let handler = ClientHandler;
 
         let mut session = client::connect(config, (host, port), handler)
             .await
@@ -479,11 +467,8 @@ impl SshClientConnection {
         };
 
         let config = Arc::new(config);
-        let message_buffer = Arc::new(Mutex::new(MessageBuffer::new()));
 
-        let handler = ClientHandler {
-            message_buffer: message_buffer.clone(),
-        };
+        let handler = ClientHandler;
 
         let mut session = client::connect(config, (host, port), handler)
             .await
