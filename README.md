@@ -135,8 +135,6 @@ ssh-add ~/.ssh/id_ed25519
 # Basic
 ./target/release/halfremembered-launcher client user@server
 
-# With logging
-./target/release/halfremembered-launcher client user@server
 ```
 
 ### Windows
@@ -157,8 +155,6 @@ ssh-add -l  # Verify
 # Basic
 .\halfremembered-launcher.exe client user@server
 
-# With logging
-.\halfremembered-launcher.exe client user@server
 ```
 
 **Alternative**: Use Pageant (PuTTY's agent) - russh auto-detects it.
