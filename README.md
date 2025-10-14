@@ -52,7 +52,7 @@ The launcher uses persistent SSH connections with multiplexed channels for bidir
 graph LR
     subgraph Client["Client Machine"]
         CP[Client Master Process]
-        MS[Master Session<br/>- Control Chan<br/>- Rsync Chan<br/>- SFTP Chan<br/>- Heartbeat]
+        MS[Master Session<br/>- Control Chan<br/>- Rsync Chan<br/>- Heartbeat]
         CP --> MS
     end
 
