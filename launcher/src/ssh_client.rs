@@ -67,6 +67,62 @@ async fn connect_agent(agent_socket: Option<&str>) -> Result<PlatformAgentClient
         .context(format!("Failed to connect to ssh-agent named pipe at {}. Make sure OpenSSH authentication agent service is running", pipe_path))
 }
 
+/// Connect to SSH server and authenticate with ssh-agent
+async fn connect_and_authenticate(
+    host: &str,
+    port: u16,
+    user: &str,
+    agent_socket: Option<&str>,
+    timeout_secs: u64,
+) -> Result<Handle<ClientHandler>> {
+    let config = client::Config {
+        inactivity_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
+        ..Default::default()
+    };
+
+    let config = Arc::new(config);
+    let handler = ClientHandler;
+
+    let mut session = client::connect(config, (host, port), handler)
+        .await
+        .context(format!("Failed to connect to {}:{}", host, port))?;
+
+    let mut agent = connect_agent(agent_socket).await?;
+
+    let identities = agent
+        .request_identities()
+        .await
+        .context("Failed to list ssh-agent identities")?;
+
+    if identities.is_empty() {
+        anyhow::bail!("No identities found in ssh-agent. Add a key with: ssh-add");
+    }
+
+    let mut authenticated = false;
+    for public_key in identities {
+        match session
+            .authenticate_publickey_with(user, public_key, None, &mut agent)
+            .await
+        {
+            Ok(auth_result) if auth_result.success() => {
+                authenticated = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(e) => {
+                log::debug!("Auth attempt failed: {:?}", e);
+                continue;
+            }
+        }
+    }
+
+    if !authenticated {
+        anyhow::bail!("All ssh-agent identities rejected by server");
+    }
+
+    Ok(session)
+}
+
 impl SshClientConnection {
     pub async fn connect(
         host: &str,
@@ -76,65 +132,10 @@ impl SshClientConnection {
     ) -> Result<Self> {
         log::info!("Connecting to {}:{} as {}", host, port, user);
 
-        let config = client::Config {
-            inactivity_timeout: Some(std::time::Duration::from_secs(3600)),
-            ..Default::default()
-        };
-
-        let config = Arc::new(config);
-        let message_buffer = Arc::new(Mutex::new(MessageBuffer::new()));
-
-        let handler = ClientHandler;
-
-        let mut session = client::connect(config, (host, port), handler).await?;
-
-        // Try to authenticate using ssh-agent
-        log::info!("Attempting authentication with ssh-agent");
-
-        let mut agent = connect_agent(agent_socket).await?;
-
-        let identities = agent
-            .request_identities()
-            .await
-            .context("Failed to list ssh-agent identities")?;
-
-        log::debug!("Found {} identities in ssh-agent", identities.len());
-
-        if identities.is_empty() {
-            anyhow::bail!("No identities found in ssh-agent. Add a key with: ssh-add");
-        }
-
-        let mut authenticated = false;
-        for public_key in identities {
-            log::debug!(
-                "Trying key fingerprint: {}",
-                public_key.fingerprint(keys::HashAlg::Sha256)
-            );
-
-            match session
-                .authenticate_publickey_with(user, public_key, None, &mut agent)
-                .await
-            {
-                Ok(auth_result) if auth_result.success() => {
-                    log::info!("Successfully authenticated with ssh-agent");
-                    authenticated = true;
-                    break;
-                }
-                Ok(_) => continue,
-                Err(e) => {
-                    log::debug!("Auth attempt failed: {:?}", e);
-                    continue;
-                }
-            }
-        }
-
-        if !authenticated {
-            anyhow::bail!("All ssh-agent identities rejected by server");
-        }
+        let session = connect_and_authenticate(host, port, user, agent_socket, 3600).await?;
 
         log::info!("SSH connection established");
 
-        // Open a session channel for our protocol
         let channel = session
             .channel_open_session()
             .await
@@ -143,7 +144,7 @@ impl SshClientConnection {
         Ok(Self {
             session,
             channel: Arc::new(Mutex::new(Some(channel))),
-            message_buffer,
+            message_buffer: Arc::new(Mutex::new(MessageBuffer::new())),
         })
     }
 
@@ -247,52 +248,7 @@ impl SshClientConnection {
             remote_path
         );
 
-        let config = client::Config {
-            inactivity_timeout: Some(std::time::Duration::from_secs(30)),
-            ..Default::default()
-        };
-
-        let config = Arc::new(config);
-
-        let handler = ClientHandler;
-
-        let mut session = client::connect(config, (host, port), handler)
-            .await
-            .context(format!("Failed to connect to {}:{}", host, port))?;
-
-        // Authenticate using ssh-agent
-        let mut agent = connect_agent(agent_socket).await?;
-
-        let identities = agent
-            .request_identities()
-            .await
-            .context("Failed to list ssh-agent identities")?;
-
-        if identities.is_empty() {
-            anyhow::bail!("No identities found in ssh-agent. Add a key with: ssh-add");
-        }
-
-        let mut authenticated = false;
-        for public_key in identities {
-            match session
-                .authenticate_publickey_with(user, public_key, None, &mut agent)
-                .await
-            {
-                Ok(auth_result) if auth_result.success() => {
-                    authenticated = true;
-                    break;
-                }
-                Ok(_) => continue,
-                Err(e) => {
-                    log::debug!("Auth attempt failed: {:?}", e);
-                    continue;
-                }
-            }
-        }
-
-        if !authenticated {
-            anyhow::bail!("All ssh-agent identities rejected by server");
-        }
+        let session = connect_and_authenticate(host, port, user, agent_socket, 30).await?;
 
         // Open SFTP channel
         let sftp_channel = session
@@ -348,52 +304,7 @@ impl SshClientConnection {
     ) -> Result<(bool, String, String)> {
         log::debug!("Executing remote command on {}:{}: {}", host, port, command);
 
-        let config = client::Config {
-            inactivity_timeout: Some(std::time::Duration::from_secs(30)),
-            ..Default::default()
-        };
-
-        let config = Arc::new(config);
-
-        let handler = ClientHandler;
-
-        let mut session = client::connect(config, (host, port), handler)
-            .await
-            .context(format!("Failed to connect to {}:{}", host, port))?;
-
-        // Authenticate using ssh-agent
-        let mut agent = connect_agent(agent_socket).await?;
-
-        let identities = agent
-            .request_identities()
-            .await
-            .context("Failed to list ssh-agent identities")?;
-
-        if identities.is_empty() {
-            anyhow::bail!("No identities found in ssh-agent. Add a key with: ssh-add");
-        }
-
-        let mut authenticated = false;
-        for public_key in identities {
-            match session
-                .authenticate_publickey_with(user, public_key, None, &mut agent)
-                .await
-            {
-                Ok(auth_result) if auth_result.success() => {
-                    authenticated = true;
-                    break;
-                }
-                Ok(_) => continue,
-                Err(e) => {
-                    log::debug!("Auth attempt failed: {:?}", e);
-                    continue;
-                }
-            }
-        }
-
-        if !authenticated {
-            anyhow::bail!("All ssh-agent identities rejected by server");
-        }
+        let session = connect_and_authenticate(host, port, user, agent_socket, 30).await?;
 
         // Open an exec channel
         let mut channel = session
@@ -461,52 +372,7 @@ impl SshClientConnection {
     ) -> Result<LocalResponse> {
         log::debug!("Sending control command to {}:{}", host, port);
 
-        let config = client::Config {
-            inactivity_timeout: Some(std::time::Duration::from_secs(30)),
-            ..Default::default()
-        };
-
-        let config = Arc::new(config);
-
-        let handler = ClientHandler;
-
-        let mut session = client::connect(config, (host, port), handler)
-            .await
-            .context(format!("Failed to connect to {}:{}", host, port))?;
-
-        // Authenticate using ssh-agent
-        let mut agent = connect_agent(agent_socket).await?;
-
-        let identities = agent
-            .request_identities()
-            .await
-            .context("Failed to list ssh-agent identities")?;
-
-        if identities.is_empty() {
-            anyhow::bail!("No identities found in ssh-agent. Add a key with: ssh-add");
-        }
-
-        let mut authenticated = false;
-        for public_key in identities {
-            match session
-                .authenticate_publickey_with(user, public_key, None, &mut agent)
-                .await
-            {
-                Ok(auth_result) if auth_result.success() => {
-                    authenticated = true;
-                    break;
-                }
-                Ok(_) => continue,
-                Err(e) => {
-                    log::debug!("Auth attempt failed: {:?}", e);
-                    continue;
-                }
-            }
-        }
-
-        if !authenticated {
-            anyhow::bail!("All ssh-agent identities rejected by server");
-        }
+        let session = connect_and_authenticate(host, port, user, agent_socket, 30).await?;
 
         // Open a session channel
         let mut channel = session
