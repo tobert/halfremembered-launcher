@@ -119,11 +119,11 @@ pub enum LocalResponse {
     Error {
         message: String,
     },
-    // TODO: Implement client status reporting
     Status {
         hostname: String,
+        version: String,
         uptime: u64,
-        connected: bool,
+        clients: Vec<ClientInfo>,
     },
     ClientList {
         clients: Vec<ClientInfo>,

@@ -26,6 +26,7 @@ pub struct SshServer {
     client_registry: Arc<Mutex<ClientRegistry>>,
     authorized_keys: Arc<Vec<ssh_key::PublicKey>>,
     rsync_file_storage: RsyncFileStorage,
+    start_time: Arc<Instant>,
 }
 
 impl SshServer {
@@ -39,6 +40,7 @@ impl SshServer {
             client_registry: Arc::new(Mutex::new(ClientRegistry::new())),
             authorized_keys: Arc::new(authorized_keys),
             rsync_file_storage: Arc::new(Mutex::new(HashMap::new())),
+            start_time: Arc::new(Instant::now()),
         })
     }
 
@@ -117,6 +119,7 @@ impl SshServer {
         command: LocalCommand,
         registry: Arc<Mutex<ClientRegistry>>,
         rsync_storage: RsyncFileStorage,
+        start_time: Arc<Instant>,
     ) -> LocalResponse {
         match command {
             LocalCommand::Ping { target } => {
@@ -239,33 +242,33 @@ impl SshServer {
             LocalCommand::Status => {
                 log::info!("Status request received");
 
-                let reg = registry.lock().await;
-                let client_count = reg.client_count();
-                let clients = reg.list_clients();
+                let hostname = hostname::get()
+                    .unwrap_or_else(|_| "unknown".into())
+                    .to_string_lossy()
+                    .to_string();
 
-                let mut status_lines = vec![
-                    format!("Server version: {}", env!("CARGO_PKG_VERSION")),
-                    format!("Connected clients: {}", client_count),
-                ];
+                let uptime = start_time.elapsed().as_secs();
 
-                if !clients.is_empty() {
-                    status_lines.push(String::new());
-                    status_lines.push("Clients:".to_string());
-                    for client in clients {
-                        let uptime_secs = client.connected_at.elapsed().as_secs();
-                        let uptime = format_duration(uptime_secs);
-                        status_lines.push(format!(
-                            "  {} ({}) - uptime: {}, last heartbeat: {}s ago",
-                            client.hostname,
-                            client.platform,
-                            uptime,
-                            client.last_heartbeat.elapsed().as_secs()
-                        ));
-                    }
-                }
+                let client_infos: Vec<halfremembered_protocol::ClientInfo> = {
+                    let reg = registry.lock().await;
+                    let clients = reg.list_clients();
+                    clients
+                        .iter()
+                        .map(|c| halfremembered_protocol::ClientInfo {
+                            hostname: c.hostname.clone(),
+                            platform: c.platform.clone(),
+                            session_id: c.session_id.clone(),
+                            connected_at: c.connected_at.elapsed().as_secs(),
+                            last_heartbeat: c.last_heartbeat.elapsed().as_secs(),
+                        })
+                        .collect()
+                };
 
-                LocalResponse::Success {
-                    message: status_lines.join("\n"),
+                LocalResponse::Status {
+                    hostname,
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    uptime,
+                    clients: client_infos,
                 }
             }
         }
@@ -392,6 +395,7 @@ impl russh::server::Server for SshServer {
             session_type: SessionType::Unknown,
             rsync_channels: HashMap::new(),
             rsync_file_storage: self.rsync_file_storage.clone(),
+            start_time: self.start_time.clone(),
         }
     }
 }
@@ -430,6 +434,7 @@ pub struct SshSession {
     session_type: SessionType,
     rsync_channels: HashMap<ChannelId, RsyncChannelState>,
     rsync_file_storage: RsyncFileStorage,
+    start_time: Arc<Instant>,
 }
 
 impl russh::server::Handler for SshSession {
@@ -707,6 +712,7 @@ impl SshSession {
             command,
             self.client_registry.clone(),
             self.rsync_file_storage.clone(),
+            self.start_time.clone(),
         )
         .await;
 
