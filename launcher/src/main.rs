@@ -497,8 +497,28 @@ async fn main() -> Result<()> {
             .await?;
 
             match response {
-                LocalResponse::Success { message } => {
-                    println!("{}", message);
+                LocalResponse::Status {
+                    hostname,
+                    version,
+                    uptime,
+                    clients,
+                } => {
+                    println!("Server: {}", hostname);
+                    println!("Version: {}", version);
+                    println!("Uptime: {}", format_duration(uptime));
+                    println!("Connected clients: {}", clients.len());
+
+                    if !clients.is_empty() {
+                        println!();
+                        println!("Clients:");
+                        for client in clients {
+                            let client_uptime = format_duration(client.connected_at);
+                            println!(
+                                "  {} ({}) - uptime: {}, last heartbeat: {}s ago",
+                                client.hostname, client.platform, client_uptime, client.last_heartbeat
+                            );
+                        }
+                    }
                 }
                 LocalResponse::Error { message } => {
                     eprintln!("Error: {}", message);
@@ -611,5 +631,22 @@ fn parse_host_port(host_str: &str) -> Result<(String, Option<u16>)> {
         _ => {
             anyhow::bail!("Invalid host:port format");
         }
+    }
+}
+
+fn format_duration(seconds: u64) -> String {
+    let days = seconds / 86400;
+    let hours = (seconds % 86400) / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let secs = seconds % 60;
+
+    if days > 0 {
+        format!("{}d {}h {}m", days, hours, minutes)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, minutes)
+    } else if minutes > 0 {
+        format!("{}m {}s", minutes, secs)
+    } else {
+        format!("{}s", secs)
     }
 }
