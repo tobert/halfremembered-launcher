@@ -136,7 +136,7 @@ ssh-add ~/.ssh/id_ed25519
 ./target/release/halfremembered-launcher client user@server
 
 # With logging
-RUST_LOG=info ./target/release/halfremembered-launcher client user@server
+./target/release/halfremembered-launcher client user@server
 ```
 
 ### Windows
@@ -158,7 +158,7 @@ ssh-add -l  # Verify
 .\halfremembered-launcher.exe client user@server
 
 # With logging
-$env:RUST_LOG="info"; .\halfremembered-launcher.exe client user@server
+.\halfremembered-launcher.exe client user@server
 ```
 
 **Alternative**: Use Pageant (PuTTY's agent) - russh auto-detects it.
@@ -171,7 +171,7 @@ $env:RUST_LOG="info"; .\halfremembered-launcher.exe client user@server
 | Binary | Native ELF | Static .exe (no DLLs) | Single file deployment |
 | File Paths | Unix paths | Windows paths auto-handled | Rust handles conversion |
 | Permissions | chmod via Rust API | Not needed on Windows | Conditional compilation |
-| Logging | `RUST_LOG=info ./binary` | `$env:RUST_LOG="info"` | Different env syntax |
+| Logging | `RUST_LOG=debug ./binary` | `$env:RUST_LOG="debug"` | Different env syntax |
 | Networking | Pure Rust (russh) | Pure Rust (russh) | Identical implementation |
 
 ### Troubleshooting
