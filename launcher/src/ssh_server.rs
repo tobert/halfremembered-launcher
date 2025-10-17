@@ -16,16 +16,19 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::client_registry::{ClientRegistry, ConnectedClient};
+use crate::file_watcher::FileWatcher;
 use crate::rsync_utils;
 
 /// Shared storage for rsync file data: maps request_id to (file_path, file_contents)
 type RsyncFileStorage = Arc<Mutex<HashMap<String, (PathBuf, Vec<u8>)>>>;
+type FileWatcherRef = Arc<Mutex<Option<FileWatcher>>>;
 
 #[derive(Clone)]
 pub struct SshServer {
     client_registry: Arc<Mutex<ClientRegistry>>,
     authorized_keys: Arc<Vec<ssh_key::PublicKey>>,
     rsync_file_storage: RsyncFileStorage,
+    file_watcher: FileWatcherRef,
     start_time: Arc<Instant>,
 }
 
@@ -40,6 +43,7 @@ impl SshServer {
             client_registry: Arc::new(Mutex::new(ClientRegistry::new())),
             authorized_keys: Arc::new(authorized_keys),
             rsync_file_storage: Arc::new(Mutex::new(HashMap::new())),
+            file_watcher: Arc::new(Mutex::new(None)),
             start_time: Arc::new(Instant::now()),
         })
     }
@@ -119,6 +123,7 @@ impl SshServer {
         command: LocalCommand,
         registry: Arc<Mutex<ClientRegistry>>,
         rsync_storage: RsyncFileStorage,
+        file_watcher: FileWatcherRef,
         start_time: Arc<Instant>,
     ) -> LocalResponse {
         match command {
@@ -282,27 +287,100 @@ impl SshServer {
                 log::debug!("Include patterns: {:?}", include_patterns);
                 log::debug!("Exclude patterns: {:?}", exclude_patterns);
 
-                // TODO: Implement filesystem watching
-                // This requires integrating the FileWatcher with the server state
-                LocalResponse::Error {
-                    message: "Filesystem watching not yet implemented".to_string(),
+                let mut watcher_lock = file_watcher.lock().await;
+
+                // Create FileWatcher lazily on first watch
+                if watcher_lock.is_none() {
+                    let registry_clone = registry.clone();
+                    let storage_clone = rsync_storage.clone();
+
+                    // Create callback that syncs files when they change
+                    let callback = move |_watch_root: PathBuf, relative: PathBuf, absolute: PathBuf| {
+                        let registry = registry_clone.clone();
+                        let storage = storage_clone.clone();
+                        let relative_str = relative.to_string_lossy().to_string();
+
+                        log::info!("File changed: {} -> syncing to clients", absolute.display());
+
+                        tokio::spawn(async move {
+                            if let Err(e) = Self::sync_file_to_clients(
+                                &absolute.to_string_lossy(),
+                                &relative_str,
+                                registry,
+                                storage,
+                            ).await {
+                                log::error!("Failed to sync changed file: {:#}", e);
+                            }
+                        });
+                    };
+
+                    match FileWatcher::new(callback) {
+                        Ok(watcher) => {
+                            log::info!("Created FileWatcher");
+                            *watcher_lock = Some(watcher);
+                        }
+                        Err(e) => {
+                            return LocalResponse::Error {
+                                message: format!("Failed to create file watcher: {:#}", e),
+                            };
+                        }
+                    }
+                }
+
+                // Add the watch
+                let result = watcher_lock
+                    .as_mut()
+                    .unwrap()
+                    .add_watch(
+                        PathBuf::from(&path),
+                        recursive,
+                        include_patterns,
+                        exclude_patterns,
+                    );
+
+                match result {
+                    Ok(_) => LocalResponse::Success {
+                        message: format!("Watching {}", path),
+                    },
+                    Err(e) => LocalResponse::Error {
+                        message: format!("Failed to add watch: {:#}", e),
+                    },
                 }
             }
 
             LocalCommand::UnwatchDirectory { path } => {
                 log::info!("Unwatch directory request: {}", path);
 
-                // TODO: Implement filesystem watching
-                LocalResponse::Error {
-                    message: "Filesystem watching not yet implemented".to_string(),
+                let mut watcher_lock = file_watcher.lock().await;
+
+                if let Some(watcher) = watcher_lock.as_mut() {
+                    match watcher.remove_watch(Path::new(&path)) {
+                        Ok(_) => LocalResponse::Success {
+                            message: format!("Stopped watching {}", path),
+                        },
+                        Err(e) => LocalResponse::Error {
+                            message: format!("Failed to remove watch: {:#}", e),
+                        },
+                    }
+                } else {
+                    LocalResponse::Error {
+                        message: "No file watcher active".to_string(),
+                    }
                 }
             }
 
             LocalCommand::ListWatches => {
                 log::info!("List watches request");
 
-                // TODO: Implement filesystem watching
-                LocalResponse::WatchList { watches: vec![] }
+                let watcher_lock = file_watcher.lock().await;
+
+                if let Some(watcher) = watcher_lock.as_ref() {
+                    LocalResponse::WatchList {
+                        watches: watcher.list_watches(),
+                    }
+                } else {
+                    LocalResponse::WatchList { watches: vec![] }
+                }
             }
         }
     }
@@ -411,6 +489,7 @@ impl russh::server::Server for SshServer {
             session_type: SessionType::Unknown,
             rsync_channels: HashMap::new(),
             rsync_file_storage: self.rsync_file_storage.clone(),
+            file_watcher: self.file_watcher.clone(),
             start_time: self.start_time.clone(),
         }
     }
@@ -450,6 +529,7 @@ pub struct SshSession {
     session_type: SessionType,
     rsync_channels: HashMap<ChannelId, RsyncChannelState>,
     rsync_file_storage: RsyncFileStorage,
+    file_watcher: FileWatcherRef,
     start_time: Arc<Instant>,
 }
 
@@ -728,6 +808,7 @@ impl SshSession {
             command,
             self.client_registry.clone(),
             self.rsync_file_storage.clone(),
+            self.file_watcher.clone(),
             self.start_time.clone(),
         )
         .await;

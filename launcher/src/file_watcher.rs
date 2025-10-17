@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use halfremembered_protocol::WatchInfo;
 use notify::RecursiveMode;
-use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
+use notify_debouncer_mini::{new_debouncer, Debouncer};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -99,7 +99,8 @@ pub struct FileWatcher {
     watches: Arc<Mutex<HashMap<PathBuf, WatchConfig>>>,
     /// The underlying debounced watcher (type-erased)
     _debouncer: Debouncer<notify::RecommendedWatcher>,
-    /// Channel for receiving debounced events
+    /// Channel for receiving debounced events (dummy - real receiver is in thread)
+    #[allow(dead_code)]
     event_receiver: mpsc::Receiver<Vec<PathBuf>>,
 }
 
