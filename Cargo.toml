@@ -32,3 +32,6 @@ rand_core = "0.6"
 uuid = { version = "1.0", features = ["v4"] }
 fast_rsync = "0.2"
 toml = "0.8"
+notify = "7.0"
+notify-debouncer-mini = "0.5"
+globset = "0.4"

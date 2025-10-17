@@ -100,6 +100,16 @@ pub enum LocalCommand {
         binary: String,
         args: Vec<String>,
     },
+    WatchDirectory {
+        path: String,
+        recursive: bool,
+        include_patterns: Vec<String>,
+        exclude_patterns: Vec<String>,
+    },
+    UnwatchDirectory {
+        path: String,
+    },
+    ListWatches,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -109,6 +119,14 @@ pub struct ClientInfo {
     pub session_id: String,
     pub connected_at: u64,
     pub last_heartbeat: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WatchInfo {
+    pub path: String,
+    pub recursive: bool,
+    pub include_patterns: Vec<String>,
+    pub exclude_patterns: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -127,6 +145,9 @@ pub enum LocalResponse {
     },
     ClientList {
         clients: Vec<ClientInfo>,
+    },
+    WatchList {
+        watches: Vec<WatchInfo>,
     },
 }
 

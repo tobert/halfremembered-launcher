@@ -271,6 +271,39 @@ impl SshServer {
                     clients: client_infos,
                 }
             }
+
+            LocalCommand::WatchDirectory {
+                path,
+                recursive,
+                include_patterns,
+                exclude_patterns,
+            } => {
+                log::info!("Watch directory request: {} (recursive: {})", path, recursive);
+                log::debug!("Include patterns: {:?}", include_patterns);
+                log::debug!("Exclude patterns: {:?}", exclude_patterns);
+
+                // TODO: Implement filesystem watching
+                // This requires integrating the FileWatcher with the server state
+                LocalResponse::Error {
+                    message: "Filesystem watching not yet implemented".to_string(),
+                }
+            }
+
+            LocalCommand::UnwatchDirectory { path } => {
+                log::info!("Unwatch directory request: {}", path);
+
+                // TODO: Implement filesystem watching
+                LocalResponse::Error {
+                    message: "Filesystem watching not yet implemented".to_string(),
+                }
+            }
+
+            LocalCommand::ListWatches => {
+                log::info!("List watches request");
+
+                // TODO: Implement filesystem watching
+                LocalResponse::WatchList { watches: vec![] }
+            }
         }
     }
 

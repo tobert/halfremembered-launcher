@@ -1,6 +1,7 @@
 mod client_daemon;
 mod client_registry;
 mod config;
+mod file_watcher;
 mod rsync_utils;
 mod ssh_client;
 mod ssh_server;
