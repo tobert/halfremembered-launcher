@@ -190,6 +190,69 @@ enum Commands {
         agent_socket: Option<String>,
     },
 
+    /// Watch a directory for changes and auto-sync to clients (server-side command)
+    Watch {
+        /// Server connection string (user@host or just host, defaults to $USER@localhost)
+        #[arg(short, long)]
+        server: Option<String>,
+
+        /// Server port
+        #[arg(short = 'P', long, default_value = "20222")]
+        port: u16,
+
+        /// Directory to watch
+        directory: PathBuf,
+
+        /// Watch recursively
+        #[arg(short, long, default_value = "true")]
+        recursive: bool,
+
+        /// Include patterns (e.g., "*.rs", "*.toml")
+        #[arg(long)]
+        include: Vec<String>,
+
+        /// Exclude patterns (e.g., "*.tmp", "target/*")
+        #[arg(long)]
+        exclude: Vec<String>,
+
+        /// SSH agent socket path
+        #[arg(long)]
+        agent_socket: Option<String>,
+    },
+
+    /// Stop watching a directory (server-side command)
+    Unwatch {
+        /// Server connection string (user@host or just host, defaults to $USER@localhost)
+        #[arg(short, long)]
+        server: Option<String>,
+
+        /// Server port
+        #[arg(short = 'P', long, default_value = "20222")]
+        port: u16,
+
+        /// Directory to stop watching
+        directory: PathBuf,
+
+        /// SSH agent socket path
+        #[arg(long)]
+        agent_socket: Option<String>,
+    },
+
+    /// List active filesystem watches (server-side command)
+    ListWatches {
+        /// Server connection string (user@host or just host, defaults to $USER@localhost)
+        #[arg(short, long)]
+        server: Option<String>,
+
+        /// Server port
+        #[arg(short = 'P', long, default_value = "20222")]
+        port: u16,
+
+        /// SSH agent socket path
+        #[arg(long)]
+        agent_socket: Option<String>,
+    },
+
     /// Sync files using .hrlauncher.toml config with automatic filesystem watching
     ConfigSync {
         /// Server connection string (user@host or just host, defaults to $USER@localhost)
@@ -583,6 +646,139 @@ async fn main() -> Result<()> {
                 }
                 _ => {
                     eprintln!("✗ Unexpected response: {:?}", response);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::Watch {
+            server,
+            port,
+            directory,
+            recursive,
+            include,
+            exclude,
+            agent_socket,
+        } => {
+            log::info!("Adding watch for directory: {}", directory.display());
+
+            let server = server.unwrap_or_else(|| format!("{}@localhost", get_default_user().unwrap()));
+            let (user, host, conn_port) = parse_connection_string(&server)?;
+            let final_port = conn_port.unwrap_or(port);
+            let command = LocalCommand::WatchDirectory {
+                path: directory.to_string_lossy().to_string(),
+                recursive,
+                include_patterns: include,
+                exclude_patterns: exclude,
+            };
+
+            let response = ssh_client::SshClientConnection::send_control_command(
+                &host,
+                final_port,
+                &user,
+                command,
+                agent_socket.as_deref(),
+            )
+            .await?;
+
+            match response {
+                LocalResponse::Success { message } => {
+                    println!("✓ {}", message);
+                }
+                LocalResponse::Error { message } => {
+                    eprintln!("✗ Error: {}", message);
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!("✗ Unexpected response: {:?}", response);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::Unwatch {
+            server,
+            port,
+            directory,
+            agent_socket,
+        } => {
+            log::info!("Removing watch for directory: {}", directory.display());
+
+            let server = server.unwrap_or_else(|| format!("{}@localhost", get_default_user().unwrap()));
+            let (user, host, conn_port) = parse_connection_string(&server)?;
+            let final_port = conn_port.unwrap_or(port);
+            let command = LocalCommand::UnwatchDirectory {
+                path: directory.to_string_lossy().to_string(),
+            };
+
+            let response = ssh_client::SshClientConnection::send_control_command(
+                &host,
+                final_port,
+                &user,
+                command,
+                agent_socket.as_deref(),
+            )
+            .await?;
+
+            match response {
+                LocalResponse::Success { message } => {
+                    println!("✓ {}", message);
+                }
+                LocalResponse::Error { message } => {
+                    eprintln!("✗ Error: {}", message);
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!("✗ Unexpected response: {:?}", response);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::ListWatches {
+            server,
+            port,
+            agent_socket,
+        } => {
+            log::debug!("Listing active watches");
+
+            let server = server.unwrap_or_else(|| format!("{}@localhost", get_default_user().unwrap()));
+            let (user, host, conn_port) = parse_connection_string(&server)?;
+            let final_port = conn_port.unwrap_or(port);
+            let command = LocalCommand::ListWatches;
+
+            let response = ssh_client::SshClientConnection::send_control_command(
+                &host,
+                final_port,
+                &user,
+                command,
+                agent_socket.as_deref(),
+            )
+            .await?;
+
+            match response {
+                LocalResponse::WatchList { watches } => {
+                    if watches.is_empty() {
+                        println!("No active watches");
+                    } else {
+                        println!("Active watches ({}):", watches.len());
+                        for watch in watches {
+                            println!("  {} (recursive: {})", watch.path, watch.recursive);
+                            if !watch.include_patterns.is_empty() {
+                                println!("    Include: {:?}", watch.include_patterns);
+                            }
+                            if !watch.exclude_patterns.is_empty() {
+                                println!("    Exclude: {:?}", watch.exclude_patterns);
+                            }
+                        }
+                    }
+                }
+                LocalResponse::Error { message } => {
+                    eprintln!("Error: {}", message);
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!("Unexpected response: {:?}", response);
                     std::process::exit(1);
                 }
             }
