@@ -1,0 +1,76 @@
+# HalfRemembered Launcher Configuration Example
+#
+# This file defines automatic file syncing rules. Place a .hrlauncher.toml
+# file in your project root to enable config-based syncing with automatic
+# filesystem watching.
+#
+# Usage:
+#   halfremembered-launcher config-sync --server user@host
+#
+# When config-sync runs, it will:
+# 1. Load .hrlauncher.toml from current directory or ancestors
+# 2. Set up filesystem watches for all include patterns
+# 3. Automatically sync changes to connected clients
+# 4. Run continuously until interrupted
+
+[project]
+# Project name (used in logs and display)
+name = "my-project"
+
+# Optional: Project description
+description = "Example HalfRemembered Launcher configuration"
+
+# Sync rules - each [[sync]] block defines files to watch and sync
+#
+# Rules are evaluated independently. You can have multiple rules for
+# different file types, destinations, or client targets.
+
+[[sync]]
+# Optional: Name for this sync rule (shows in logs)
+name = "executables"
+
+# Glob patterns for files to watch and sync
+# Patterns are relative to the .hrlauncher.toml location
+# Supports ** for recursive matching
+include = [
+    "target/release/*.exe",
+    "target/release/*.dll",
+]
+
+# Destination path on clients
+# - Relative paths: relative to client's working directory
+# - Absolute paths: written to absolute location
+# - ~/ expands to client's home directory
+destination = "bin/"
+
+# Optional: Only sync to clients matching these hostname patterns
+# Supports glob patterns: "windows-*", "dev-*", "prod-*"
+# If omitted, syncs to all connected clients
+clients = ["windows-*"]
+
+[[sync]]
+name = "assets"
+
+# Asset directory with recursive matching
+include = ["assets/**/*"]
+
+# Optional: Exclude patterns (applied after include)
+# Useful for excluding temp files, backups, or build artifacts
+exclude = [
+    "**/*.psd",         # Photoshop source files
+    "**/*.blend",       # Blender source files
+    "**/.DS_Store",     # macOS metadata
+    "**/*~",            # Backup files
+]
+
+destination = "assets/"
+
+# Optional: Mirror mode - delete files on clients that don't exist in source
+# Use with caution! This will remove files.
+# Default: false
+mirror = true
+
+[[sync]]
+name = "config-files"
+include = ["*.toml", "*.json"]
+destination = "."

@@ -1,5 +1,6 @@
 mod client_daemon;
 mod client_registry;
+mod config;
 mod rsync_utils;
 mod ssh_client;
 mod ssh_server;
@@ -182,6 +183,25 @@ enum Commands {
         /// Server port
         #[arg(short = 'P', long, default_value = "20222")]
         port: u16,
+
+        /// SSH agent socket path
+        #[arg(long)]
+        agent_socket: Option<String>,
+    },
+
+    /// Sync files using .hrlauncher.toml config with automatic filesystem watching
+    ConfigSync {
+        /// Server connection string (user@host or just host, defaults to $USER@localhost)
+        #[arg(short, long)]
+        server: Option<String>,
+
+        /// Server port
+        #[arg(short = 'P', long, default_value = "20222")]
+        port: u16,
+
+        /// Path to config file (default: search for .hrlauncher.toml in current dir and parents)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
 
         /// SSH agent socket path
         #[arg(long)]
@@ -565,6 +585,76 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+
+        Commands::ConfigSync {
+            server: _,
+            port: _,
+            config,
+            agent_socket: _,
+        } => {
+            // Load config from specified path or search for it
+            let (config_path, config) = if let Some(path) = config {
+                let cfg = config::Config::from_file(&path)?;
+                (path, cfg)
+            } else {
+                config::Config::find_and_load()?
+            };
+
+            log::info!("Loaded config from: {}", config_path.display());
+            log::info!("Project: {}", config.project.name);
+            log::info!("Sync rules: {}", config.sync_rules.len());
+
+            for (idx, rule) in config.sync_rules.iter().enumerate() {
+                let default_name = format!("rule-{}", idx + 1);
+                let rule_name = rule
+                    .name
+                    .as_deref()
+                    .unwrap_or(&default_name);
+                log::info!(
+                    "  [{}] {} include patterns, destination: {}",
+                    rule_name,
+                    rule.include.len(),
+                    rule.destination
+                );
+            }
+
+            println!("✓ Loaded config: {}", config.project.name);
+            println!("  Config file: {}", config_path.display());
+            println!("  Sync rules: {}", config.sync_rules.len());
+            println!();
+
+            // TODO: Implement filesystem watching and automatic syncing
+            // This requires the file_watcher module from botdocs/01-feat-notify-plan.md
+            //
+            // Planned implementation:
+            // 1. For each sync rule:
+            //    - Expand glob patterns to get initial file list
+            //    - Set up filesystem watch for parent directories
+            //    - Register patterns with include/exclude filters
+            // 2. Connect to server
+            // 3. Sync all matched files initially (optional)
+            // 4. Watch for changes and sync automatically
+            // 5. Run until interrupted (Ctrl+C)
+            //
+            // See CONFIG.md for usage examples and botdocs/01-feat-notify-plan.md
+            // for implementation details.
+
+            eprintln!();
+            eprintln!("⚠ Config-based syncing with filesystem watching is not yet implemented.");
+            eprintln!();
+            eprintln!("This feature requires:");
+            eprintln!("  • Implementing the file_watcher module (see botdocs/01-feat-notify-plan.md)");
+            eprintln!("  • Adding notify, notify-debouncer-mini, and globset dependencies");
+            eprintln!("  • Integrating watch events with sync operations");
+            eprintln!();
+            eprintln!("For now, use the manual 'sync' command:");
+            eprintln!("  halfremembered-launcher sync <file> --destination <dest> --server user@host");
+            eprintln!();
+            eprintln!("Your config file is ready and valid! Once the watch system is implemented,");
+            eprintln!("this command will automatically sync your files on every change.");
+
+            std::process::exit(1);
         }
     }
 
