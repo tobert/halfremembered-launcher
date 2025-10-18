@@ -46,3 +46,12 @@ id_ed25519*
 # Binary executables (if copied to root)
 halfremembered-launcher
 halfremembered-launcher.exe
+
+# Ignore all markdown files by default
+*.md
+
+# But don't ignore these specific markdown files
+!README.md
+!BOTS.md
+!CONFIG.md
+!botdocs/01-feat-notify-plan.md
