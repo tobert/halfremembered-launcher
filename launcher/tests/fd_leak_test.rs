@@ -1,6 +1,7 @@
 
 use anyhow::{Context, Result};
 use halfremembered_launcher::ssh_server::SshServer;
+use serial_test::serial;
 use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -55,6 +56,7 @@ async fn setup_test() -> Result<TestFixture> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(unix)] // rlimit is Unix-specific
+#[serial]
 async fn test_fd_leak_on_sync() -> Result<()> {
     // Set a low file descriptor limit for this process
     let (original_soft, original_hard) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
