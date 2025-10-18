@@ -402,10 +402,13 @@ impl SshServer {
             anyhow::bail!("File not found: {}", file_path);
         }
 
-        // Open file and mmap it
-        let file = std::fs::File::open(&path).context("Failed to open file")?;
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let file_data = Arc::new(mmap);
+        // Open file, mmap it, and immediately close the file handle.
+        // The mmap will remain valid until the Arc is dropped.
+        let file_data = {
+            let file = std::fs::File::open(&path).context("Failed to open file")?;
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            Arc::new(mmap)
+        };
 
         // Read file and compute metadata
         let metadata = tokio::fs::metadata(&path)
