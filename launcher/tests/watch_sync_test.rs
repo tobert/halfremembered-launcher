@@ -8,6 +8,7 @@
 // 5. Client receives and writes the synced file
 
 use anyhow::Result;
+use std::net::TcpListener;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -29,6 +30,13 @@ impl Drop for TestFixture {
         self.server_task.abort();
         self.client_task.abort();
     }
+}
+
+// Get an unused TCP port from the OS
+fn find_free_port() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    Ok(addr.port())
 }
 
 // Polling helper: wait for a file to exist with timeout
@@ -135,7 +143,7 @@ async fn setup_test() -> Result<TestFixture> {
     log::info!("Client output dir: {}", client_output_dir.path().display());
 
     // Use a random high port to avoid conflicts
-    let test_port = 30000 + (std::process::id() % 10000) as u16;
+    let test_port = find_free_port()?;
     log::info!("Using test port: {}", test_port);
 
     // Start the server in a background task
@@ -169,7 +177,7 @@ async fn setup_test() -> Result<TestFixture> {
     });
 
     // Wait for client to actually connect and register (poll, don't sleep)
-    wait_for_client_connected(test_port, &user, Duration::from_secs(10)).await?;
+    wait_for_client_connected(test_port, &user, Duration::from_millis(500)).await?;
 
     Ok(TestFixture {
         server_task,
@@ -237,7 +245,7 @@ async fn test_watch_sync_integration() -> Result<()> {
 
     // Wait for file to be synced (with timeout)
     let synced_file_path = fixture.client_output_dir.path().join("test.txt");
-    wait_for_file_content(&synced_file_path, test_content, Duration::from_secs(5)).await?;
+    wait_for_file_content(&synced_file_path, test_content, Duration::from_millis(500)).await?;
 
     log::info!("✓ File successfully synced with correct content!");
 
@@ -247,7 +255,7 @@ async fn test_watch_sync_integration() -> Result<()> {
     log::info!("Updated test file");
 
     // Wait for updated content to be synced
-    wait_for_file_content(&synced_file_path, updated_content, Duration::from_secs(5)).await?;
+    wait_for_file_content(&synced_file_path, updated_content, Duration::from_millis(500)).await?;
 
     log::info!("✓ File update successfully synced!");
 
@@ -291,7 +299,7 @@ async fn test_watch_with_subdirectories() -> Result<()> {
         .path()
         .join("subdir")
         .join("nested.txt");
-    wait_for_file_content(&synced_nested, test_content, Duration::from_secs(10)).await?;
+    wait_for_file_content(&synced_nested, test_content, Duration::from_millis(500)).await?;
 
     log::info!("✓ Nested file successfully synced!");
 

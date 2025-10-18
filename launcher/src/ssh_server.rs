@@ -962,11 +962,11 @@ impl SshSession {
 
 impl Drop for SshSession {
     fn drop(&mut self) {
-        if let Some(ref hostname) = self.hostname {
+        if let Some(ref _hostname) = self.hostname {
             let registry = self.client_registry.clone();
-            let hostname = hostname.clone();
+            let session_id = self.session_id.clone();
             tokio::spawn(async move {
-                registry.lock().await.unregister(&hostname);
+                registry.lock().await.unregister(&session_id);
             });
         }
     }

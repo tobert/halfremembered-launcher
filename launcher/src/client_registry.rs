@@ -33,20 +33,21 @@ impl ClientRegistry {
             client.session_id,
             client.platform
         );
-        self.clients.insert(client.hostname.clone(), client);
+        self.clients.insert(client.session_id.clone(), client);
         Ok(())
     }
 
-    pub fn unregister(&mut self, hostname: &str) {
-        if self.clients.remove(hostname).is_some() {
-            log::info!("Unregistered client: {}", hostname);
+    pub fn unregister(&mut self, session_id: &str) {
+        if self.clients.remove(session_id).is_some() {
+            log::info!("Unregistered client session: {}", session_id);
         }
     }
 
     pub async fn send_to_client(&mut self, hostname: &str, msg: &ServerMessage) -> Result<()> {
         let client = self
             .clients
-            .get(hostname)
+            .values()
+            .find(|c| c.hostname == hostname)
             .context(format!("Client not found: {}", hostname))?;
 
         let mut full_message = Vec::new();
@@ -84,7 +85,7 @@ impl ClientRegistry {
     }
 
     pub fn update_heartbeat(&mut self, hostname: &str) {
-        if let Some(client) = self.clients.get_mut(hostname) {
+        if let Some(client) = self.clients.values_mut().find(|c| c.hostname == hostname) {
             client.last_heartbeat = Instant::now();
         }
     }
