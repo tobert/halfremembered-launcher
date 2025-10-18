@@ -1,13 +1,6 @@
-mod client_daemon;
-mod client_registry;
-mod config;
-mod file_watcher;
-mod rsync_utils;
-mod ssh_client;
-mod ssh_server;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use halfremembered_launcher::{client_daemon, config, ssh_client, ssh_server};
 use halfremembered_protocol::{LocalCommand, LocalResponse};
 use std::path::PathBuf;
 

@@ -18,6 +18,7 @@ pub struct ClientDaemon {
     heartbeat_interval: Duration,
     reconnect_delay: Duration,
     agent_socket: Option<String>,
+    working_dir: Option<std::path::PathBuf>,
     shutdown: Arc<AtomicBool>,
     state: Arc<Mutex<ClientState>>,
     connection: Option<SshClientConnection>,
@@ -43,6 +44,7 @@ impl ClientDaemon {
             heartbeat_interval: Duration::from_secs(30),
             reconnect_delay: Duration::from_secs(5),
             agent_socket: None,
+            working_dir: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(ClientState {
                 connected_since,
@@ -66,6 +68,11 @@ impl ClientDaemon {
 
     pub fn with_agent_socket(mut self, agent_socket: Option<String>) -> Self {
         self.agent_socket = agent_socket;
+        self
+    }
+
+    pub fn with_working_dir(mut self, working_dir: std::path::PathBuf) -> Self {
+        self.working_dir = Some(working_dir);
         self
     }
 
@@ -261,7 +268,13 @@ impl ClientDaemon {
         log::info!("Rsync start: {} (block_size: {})", relative_path, block_size);
 
         let start_time = std::time::Instant::now();
-        let local_path = std::path::PathBuf::from(&relative_path);
+
+        // Construct local path relative to working directory if set
+        let local_path = if let Some(ref working_dir) = self.working_dir {
+            working_dir.join(&relative_path)
+        } else {
+            std::path::PathBuf::from(&relative_path)
+        };
 
         // Create parent directory if needed
         if let Some(parent) = local_path.parent()

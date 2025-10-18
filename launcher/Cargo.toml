@@ -3,6 +3,10 @@ name = "halfremembered-launcher"
 version = "0.1.0"
 edition.workspace = true
 
+[lib]
+name = "halfremembered_launcher"
+path = "src/lib.rs"
+
 [[bin]]
 name = "halfremembered-launcher"
 path = "src/main.rs"
