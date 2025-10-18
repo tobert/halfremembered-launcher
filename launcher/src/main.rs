@@ -785,10 +785,10 @@ async fn main() -> Result<()> {
         }
 
         Commands::ConfigSync {
-            server: _,
-            port: _,
+            server,
+            port,
             config,
-            agent_socket: _,
+            agent_socket,
         } => {
             // Load config from specified path or search for it
             let (config_path, config) = if let Some(path) = config {
@@ -802,56 +802,88 @@ async fn main() -> Result<()> {
             log::info!("Project: {}", config.project.name);
             log::info!("Sync rules: {}", config.sync_rules.len());
 
-            for (idx, rule) in config.sync_rules.iter().enumerate() {
-                let default_name = format!("rule-{}", idx + 1);
-                let rule_name = rule
-                    .name
-                    .as_deref()
-                    .unwrap_or(&default_name);
-                log::info!(
-                    "  [{}] {} include patterns, destination: {}",
-                    rule_name,
-                    rule.include.len(),
-                    rule.destination
-                );
-            }
-
             println!("✓ Loaded config: {}", config.project.name);
             println!("  Config file: {}", config_path.display());
             println!("  Sync rules: {}", config.sync_rules.len());
             println!();
 
-            // TODO: Implement filesystem watching and automatic syncing
-            // This requires the file_watcher module from botdocs/01-feat-notify-plan.md
-            //
-            // Planned implementation:
-            // 1. For each sync rule:
-            //    - Expand glob patterns to get initial file list
-            //    - Set up filesystem watch for parent directories
-            //    - Register patterns with include/exclude filters
-            // 2. Connect to server
-            // 3. Sync all matched files initially (optional)
-            // 4. Watch for changes and sync automatically
-            // 5. Run until interrupted (Ctrl+C)
-            //
-            // See CONFIG.md for usage examples and botdocs/01-feat-notify-plan.md
-            // for implementation details.
+            // Get config file's parent directory (the project root)
+            let project_root = config_path
+                .parent()
+                .context("Config file has no parent directory")?
+                .to_path_buf();
 
-            eprintln!();
-            eprintln!("⚠ Config-based syncing with filesystem watching is not yet implemented.");
-            eprintln!();
-            eprintln!("This feature requires:");
-            eprintln!("  • Implementing the file_watcher module (see botdocs/01-feat-notify-plan.md)");
-            eprintln!("  • Adding notify, notify-debouncer-mini, and globset dependencies");
-            eprintln!("  • Integrating watch events with sync operations");
-            eprintln!();
-            eprintln!("For now, use the manual 'sync' command:");
-            eprintln!("  halfremembered-launcher sync <file> --destination <dest> --server user@host");
-            eprintln!();
-            eprintln!("Your config file is ready and valid! Once the watch system is implemented,");
-            eprintln!("this command will automatically sync your files on every change.");
+            log::info!("Project root: {}", project_root.display());
 
-            std::process::exit(1);
+            // Connect to server
+            let server = server.unwrap_or_else(|| format!("{}@localhost", get_default_user().unwrap()));
+            let (user, host, conn_port) = parse_connection_string(&server)?;
+            let final_port = conn_port.unwrap_or(port);
+
+            println!("Setting up watches on server {}@{}:{}...", user, host, final_port);
+            println!();
+
+            // For each sync rule, set up a watch on the server
+            for (idx, rule) in config.sync_rules.iter().enumerate() {
+                let default_name = format!("rule-{}", idx + 1);
+                let rule_name = rule.name.as_deref().unwrap_or(&default_name);
+
+                log::info!(
+                    "Setting up watch for [{}]: {} -> {}",
+                    rule_name,
+                    project_root.display(),
+                    rule.destination
+                );
+
+                // Send WatchDirectory command to server
+                // Watch the project root with include/exclude patterns
+                let command = LocalCommand::WatchDirectory {
+                    path: project_root.to_string_lossy().to_string(),
+                    recursive: true,
+                    include_patterns: rule.include.clone(),
+                    exclude_patterns: rule.exclude.clone(),
+                };
+
+                let response = ssh_client::SshClientConnection::send_control_command(
+                    &host,
+                    final_port,
+                    &user,
+                    command,
+                    agent_socket.as_deref(),
+                )
+                .await?;
+
+                match response {
+                    LocalResponse::Success { message } => {
+                        println!("  ✓ [{}] {}", rule_name, message);
+                        println!("      Include: {:?}", rule.include);
+                        if !rule.exclude.is_empty() {
+                            println!("      Exclude: {:?}", rule.exclude);
+                        }
+                        println!("      Destination: {}", rule.destination);
+                    }
+                    LocalResponse::Error { message } => {
+                        eprintln!("  ✗ [{}] Error: {}", rule_name, message);
+                        std::process::exit(1);
+                    }
+                    _ => {
+                        eprintln!("  ✗ [{}] Unexpected response: {:?}", rule_name, response);
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            println!();
+            println!("✓ All watches configured successfully!");
+            println!();
+            println!("The server is now watching for file changes and will automatically");
+            println!("sync them to connected clients. File changes will be logged on the server.");
+            println!();
+            println!("To view active watches, run:");
+            println!("  halfremembered-launcher list-watches --server {}@{}", user, host);
+            println!();
+            println!("To stop a watch, run:");
+            println!("  halfremembered-launcher unwatch <directory> --server {}@{}", user, host);
         }
     }
 
