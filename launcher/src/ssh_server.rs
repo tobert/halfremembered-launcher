@@ -294,6 +294,9 @@ impl SshServer {
                     let registry_clone = registry.clone();
                     let storage_clone = rsync_storage.clone();
 
+                    // Get a handle to the current tokio runtime
+                    let runtime_handle = tokio::runtime::Handle::current();
+
                     // Create callback that syncs files when they change
                     let callback = move |_watch_root: PathBuf, relative: PathBuf, absolute: PathBuf| {
                         let registry = registry_clone.clone();
@@ -302,7 +305,8 @@ impl SshServer {
 
                         log::info!("File changed: {} -> syncing to clients", absolute.display());
 
-                        tokio::spawn(async move {
+                        // Spawn on the tokio runtime from the std::thread callback
+                        runtime_handle.spawn(async move {
                             if let Err(e) = Self::sync_file_to_clients(
                                 &absolute.to_string_lossy(),
                                 &relative_str,
