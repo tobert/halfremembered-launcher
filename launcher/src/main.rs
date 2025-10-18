@@ -183,7 +183,7 @@ enum Commands {
         agent_socket: Option<String>,
     },
 
-    /// Watch a directory for changes and auto-sync to clients (server-side command)
+    /// Watch a file or directory for changes and auto-sync to clients (server-side command)
     Watch {
         /// Server connection string (user@host or just host, defaults to $USER@localhost)
         #[arg(short, long)]
@@ -193,10 +193,10 @@ enum Commands {
         #[arg(short = 'P', long, default_value = "20222")]
         port: u16,
 
-        /// Directory to watch
-        directory: PathBuf,
+        /// File or directory to watch
+        path: PathBuf,
 
-        /// Watch recursively
+        /// Watch recursively (only applies to directories)
         #[arg(short, long, default_value = "true")]
         recursive: bool,
 
@@ -213,7 +213,7 @@ enum Commands {
         agent_socket: Option<String>,
     },
 
-    /// Stop watching a directory (server-side command)
+    /// Stop watching a file or directory (server-side command)
     Unwatch {
         /// Server connection string (user@host or just host, defaults to $USER@localhost)
         #[arg(short, long)]
@@ -223,8 +223,8 @@ enum Commands {
         #[arg(short = 'P', long, default_value = "20222")]
         port: u16,
 
-        /// Directory to stop watching
-        directory: PathBuf,
+        /// File or directory to stop watching
+        path: PathBuf,
 
         /// SSH agent socket path
         #[arg(long)]
@@ -647,19 +647,19 @@ async fn main() -> Result<()> {
         Commands::Watch {
             server,
             port,
-            directory,
+            path,
             recursive,
             include,
             exclude,
             agent_socket,
         } => {
-            log::info!("Adding watch for directory: {}", directory.display());
+            log::info!("Adding watch for path: {}", path.display());
 
             let server = server.unwrap_or_else(|| format!("{}@localhost", get_default_user().unwrap()));
             let (user, host, conn_port) = parse_connection_string(&server)?;
             let final_port = conn_port.unwrap_or(port);
             let command = LocalCommand::WatchDirectory {
-                path: directory.to_string_lossy().to_string(),
+                path: path.to_string_lossy().to_string(),
                 recursive,
                 include_patterns: include,
                 exclude_patterns: exclude,
@@ -692,16 +692,16 @@ async fn main() -> Result<()> {
         Commands::Unwatch {
             server,
             port,
-            directory,
+            path,
             agent_socket,
         } => {
-            log::info!("Removing watch for directory: {}", directory.display());
+            log::info!("Removing watch for path: {}", path.display());
 
             let server = server.unwrap_or_else(|| format!("{}@localhost", get_default_user().unwrap()));
             let (user, host, conn_port) = parse_connection_string(&server)?;
             let final_port = conn_port.unwrap_or(port);
             let command = LocalCommand::UnwatchDirectory {
-                path: directory.to_string_lossy().to_string(),
+                path: path.to_string_lossy().to_string(),
             };
 
             let response = ssh_client::SshClientConnection::send_control_command(

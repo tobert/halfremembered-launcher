@@ -7,7 +7,7 @@ use rand_core::OsRng;
 use russh::keys::*;
 use russh::server::{Auth, Msg, Server as _, Session};
 use russh::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,8 +19,9 @@ use crate::client_registry::{ClientRegistry, ConnectedClient};
 use crate::file_watcher::FileWatcher;
 use crate::rsync_utils;
 
-/// Shared storage for rsync file data: maps request_id to (file_path, file_contents)
-type RsyncFileStorage = Arc<Mutex<HashMap<String, (PathBuf, Vec<u8>)>>>;
+/// Shared storage for rsync file data: maps request_id to (file_path, file_contents, pending_clients)
+type RsyncFileStorage =
+    Arc<Mutex<HashMap<String, (PathBuf, Arc<memmap2::Mmap>, HashSet<String>)>>>;
 type FileWatcherRef = Arc<Mutex<Option<FileWatcher>>>;
 
 #[derive(Clone)]
@@ -401,10 +402,10 @@ impl SshServer {
             anyhow::bail!("File not found: {}", file_path);
         }
 
-        // Read file data
-        let file_data = tokio::fs::read(&path)
-            .await
-            .context("Failed to read file")?;
+        // Open file and mmap it
+        let file = std::fs::File::open(&path).context("Failed to open file")?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let file_data = Arc::new(mmap);
 
         // Read file and compute metadata
         let metadata = tokio::fs::metadata(&path)
@@ -444,9 +445,11 @@ impl SshServer {
             block_size,
         };
 
-        let client_count = {
+        let (client_count, client_ids) = {
             let reg = registry.lock().await;
-            reg.client_count()
+            let clients = reg.list_clients();
+            let ids: HashSet<String> = clients.iter().map(|c| c.session_id.clone()).collect();
+            (clients.len(), ids)
         };
 
         if client_count == 0 {
@@ -455,10 +458,10 @@ impl SshServer {
         }
 
         // Store file data for rsync operations
-        rsync_storage
-            .lock()
-            .await
-            .insert(request_id.clone(), (path.to_path_buf(), file_data));
+        rsync_storage.lock().await.insert(
+            request_id.clone(),
+            (path.to_path_buf(), file_data, client_ids),
+        );
 
         registry.lock().await.broadcast(&rsync_msg).await?;
 
@@ -508,7 +511,7 @@ enum SessionType {
 struct RsyncChannelState {
     request_id: Option<String>,
     file_path: Option<PathBuf>,
-    file_data: Option<Vec<u8>>,
+    file_data: Option<Arc<memmap2::Mmap>>,
     frame_buffer: FrameBuffer,
 }
 
@@ -748,6 +751,16 @@ impl SshSession {
                         error
                     );
                 }
+
+                // Clean up storage
+                let mut storage = self.rsync_file_storage.lock().await;
+                if let Some((_path, _data, pending_clients)) = storage.get_mut(&request_id) {
+                    pending_clients.remove(&self.session_id);
+                    if pending_clients.is_empty() {
+                        storage.remove(&request_id);
+                        log::debug!("Cleaned up rsync storage for request: {}", request_id);
+                    }
+                }
             }
 
             ClientMessage::ExecComplete {
@@ -890,7 +903,7 @@ impl SshSession {
 
                         // Look up file data for this request
                         let files = self.rsync_file_storage.lock().await;
-                        if let Some((file_path, file_data)) = files.get(&request_id) {
+                        if let Some((file_path, file_data, _pending)) = files.get(&request_id) {
                             state.file_path = Some(file_path.clone());
                             state.file_data = Some(file_data.clone());
                             log::debug!("Found file for request: {} bytes", file_data.len());
@@ -965,8 +978,29 @@ impl Drop for SshSession {
         if let Some(ref _hostname) = self.hostname {
             let registry = self.client_registry.clone();
             let session_id = self.session_id.clone();
+            let rsync_storage = self.rsync_file_storage.clone();
+
             tokio::spawn(async move {
+                // Unregister client
                 registry.lock().await.unregister(&session_id);
+
+                // Clean up pending rsync operations
+                let mut storage = rsync_storage.lock().await;
+                let mut requests_to_remove = Vec::new();
+
+                for (request_id, (_path, _data, pending_clients)) in storage.iter_mut() {
+                    if pending_clients.remove(&session_id) && pending_clients.is_empty() {
+                        requests_to_remove.push(request_id.clone());
+                    }
+                }
+
+                for request_id in requests_to_remove {
+                    storage.remove(&request_id);
+                    log::debug!(
+                        "Cleaned up rsync storage for request {} due to client disconnect",
+                        request_id
+                    );
+                }
             });
         }
     }

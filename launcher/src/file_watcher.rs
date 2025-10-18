@@ -144,8 +144,9 @@ impl FileWatcher {
                             // Find which watch(es) this path belongs to
                             for (watch_root, config) in watches.iter() {
                                 if config.matches(&path) {
-                                    // Compute relative path
-                                    let relative = match path.strip_prefix(watch_root) {
+                                    // Compute relative path using config.path (not watch_root key)
+                                    // For single files, watch_root is the file itself, but config.path is the parent
+                                    let relative = match path.strip_prefix(&config.path) {
                                         Ok(rel) => rel.to_path_buf(),
                                         Err(_) => continue,
                                     };
@@ -177,7 +178,7 @@ impl FileWatcher {
         })
     }
 
-    /// Add a directory to watch
+    /// Add a file or directory to watch
     pub fn add_watch(
         &mut self,
         path: PathBuf,
@@ -190,42 +191,81 @@ impl FileWatcher {
             .canonicalize()
             .context(format!("Failed to canonicalize path: {}", path.display()))?;
 
-        if !canonical.is_dir() {
-            anyhow::bail!("Path is not a directory: {}", canonical.display());
+        let is_file = canonical.is_file();
+        let is_dir = canonical.is_dir();
+
+        if !is_file && !is_dir {
+            anyhow::bail!("Path is neither a file nor directory: {}", canonical.display());
         }
 
-        log::info!(
-            "Adding watch: {} (resolved: {}, recursive: {}, include: {:?}, exclude: {:?})",
-            path.display(),
-            canonical.display(),
-            recursive,
-            include_patterns,
-            exclude_patterns
-        );
+        if is_file {
+            log::info!(
+                "Adding watch for file: {} (resolved: {})",
+                path.display(),
+                canonical.display()
+            );
 
-        // Create watch configuration
-        let config = WatchConfig::new(
-            canonical.clone(),
-            recursive,
-            include_patterns,
-            exclude_patterns,
-        )?;
+            // For single files, watch the parent directory with a filter
+            let parent = canonical.parent()
+                .context(format!("File has no parent directory: {}", canonical.display()))?
+                .to_path_buf();
 
-        // Add to watcher
-        let mode = if recursive {
-            RecursiveMode::Recursive
+            let file_name = canonical.file_name()
+                .context(format!("Cannot get filename: {}", canonical.display()))?
+                .to_string_lossy()
+                .to_string();
+
+            // Create watch configuration for the parent directory with file filter
+            let config = WatchConfig::new(
+                parent.clone(),
+                false, // Non-recursive for single file
+                vec![file_name.clone()], // Only watch this specific file
+                exclude_patterns,
+            )?;
+
+            // Watch the parent directory non-recursively
+            self._debouncer
+                .watcher()
+                .watch(&parent, RecursiveMode::NonRecursive)
+                .context(format!("Failed to watch parent directory: {}", parent.display()))?;
+
+            // Store configuration keyed by the actual file path, not parent
+            let mut watches = self.watches.lock().unwrap();
+            watches.insert(canonical, config);
         } else {
-            RecursiveMode::NonRecursive
-        };
+            log::info!(
+                "Adding watch for directory: {} (resolved: {}, recursive: {}, include: {:?}, exclude: {:?})",
+                path.display(),
+                canonical.display(),
+                recursive,
+                include_patterns,
+                exclude_patterns
+            );
 
-        self._debouncer
-            .watcher()
-            .watch(&canonical, mode)
-            .context(format!("Failed to watch directory: {}", canonical.display()))?;
+            // Create watch configuration
+            let config = WatchConfig::new(
+                canonical.clone(),
+                recursive,
+                include_patterns,
+                exclude_patterns,
+            )?;
 
-        // Store configuration
-        let mut watches = self.watches.lock().unwrap();
-        watches.insert(canonical, config);
+            // Add to watcher
+            let mode = if recursive {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+
+            self._debouncer
+                .watcher()
+                .watch(&canonical, mode)
+                .context(format!("Failed to watch directory: {}", canonical.display()))?;
+
+            // Store configuration
+            let mut watches = self.watches.lock().unwrap();
+            watches.insert(canonical, config);
+        }
 
         Ok(())
     }

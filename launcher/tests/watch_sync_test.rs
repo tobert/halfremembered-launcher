@@ -305,3 +305,80 @@ async fn test_watch_with_subdirectories() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_watch_single_file() -> Result<()> {
+    let fixture = setup_test().await?;
+
+    // Create a file to watch
+    let watched_file = fixture.server_watch_dir.path().join("specific.exe");
+    let initial_content = "version 1.0";
+    std::fs::write(&watched_file, initial_content)?;
+    log::info!("Created file to watch: {}", watched_file.display());
+
+    // Set up watch on the specific file (not the directory)
+    let watch_command = halfremembered_protocol::LocalCommand::WatchDirectory {
+        path: watched_file.to_string_lossy().to_string(),
+        recursive: false,
+        include_patterns: vec![],
+        exclude_patterns: vec![],
+    };
+
+    let response = halfremembered_launcher::ssh_client::SshClientConnection::send_control_command(
+        "localhost",
+        fixture.port,
+        &fixture.user,
+        watch_command,
+        None,
+    )
+    .await?;
+
+    match response {
+        halfremembered_protocol::LocalResponse::Success { message } => {
+            log::info!("Watch set up successfully: {}", message);
+        }
+        halfremembered_protocol::LocalResponse::Error { message } => {
+            anyhow::bail!("Failed to set up watch: {}", message)
+        }
+        _ => anyhow::bail!("Unexpected response: {:?}", response),
+    }
+
+    // Give the watch time to be fully set up
+    sleep(Duration::from_millis(500)).await;
+
+    // Modify the watched file
+    let updated_content = "version 2.0";
+    std::fs::write(&watched_file, updated_content)?;
+    log::info!("Updated watched file");
+
+    // Wait for file to be synced
+    let synced_file_path = fixture.client_output_dir.path().join("specific.exe");
+    wait_for_file_content(&synced_file_path, updated_content, Duration::from_millis(500)).await?;
+
+    log::info!("✓ Single file successfully synced with correct content!");
+
+    // Create another file in the same directory - it should NOT sync
+    let other_file = fixture.server_watch_dir.path().join("other.txt");
+    std::fs::write(&other_file, "should not sync")?;
+    log::info!("Created unrelated file in same directory");
+
+    // Verify the other file was NOT synced
+    let other_synced = fixture.client_output_dir.path().join("other.txt");
+    wait_for_file_absence(&other_synced, Duration::from_secs(2)).await?;
+
+    log::info!("✓ Other files in directory correctly not synced!");
+
+    // Give debouncer time to settle before next write
+    sleep(Duration::from_millis(200)).await;
+
+    // Update the watched file again to ensure watch is still active
+    let final_content = "version 3.0";
+    std::fs::write(&watched_file, final_content)?;
+    log::info!("Updated watched file again");
+
+    wait_for_file_content(&synced_file_path, final_content, Duration::from_secs(2)).await?;
+
+    log::info!("✓ Single file watch remains active after multiple updates!");
+
+    Ok(())
+}
