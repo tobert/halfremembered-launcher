@@ -98,6 +98,22 @@ async fn wait_for_file_absence(path: &Path, duration: Duration) -> Result<()> {
     Ok(())
 }
 
+// Polling helper: wait for server to be ready to accept connections
+async fn wait_for_server_ready(port: u16, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            log::debug!("Server is accepting connections on port {}", port);
+            return Ok(());
+        }
+
+        if start.elapsed() > timeout {
+            anyhow::bail!("Timeout waiting for server to start");
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 // Polling helper: wait for at least one client to be connected
 async fn wait_for_client_connected(port: u16, user: &str, timeout: Duration) -> Result<()> {
     let start = Instant::now();
@@ -127,6 +143,17 @@ async fn wait_for_client_connected(port: u16, user: &str, timeout: Duration) -> 
     }
 }
 
+// Coordination helper: wait for sync to complete AND debouncer to settle
+// The file watcher uses a 100ms debouncer, so we need to wait for both:
+// 1. The file to sync (polling)
+// 2. The debouncer window to pass (150ms > 100ms)
+async fn wait_for_sync_and_settle(path: &Path, expected: &str, timeout: Duration) -> Result<()> {
+    wait_for_file_content(path, expected, timeout).await?;
+    // Wait for debouncer to settle before next write
+    sleep(Duration::from_millis(150)).await;
+    Ok(())
+}
+
 // Set up test fixture with server, client, and temporary directories
 async fn setup_test() -> Result<TestFixture> {
     // Initialize logging once per test
@@ -153,8 +180,8 @@ async fn setup_test() -> Result<TestFixture> {
             .expect("Server failed to start");
     });
 
-    // Give server time to start
-    sleep(Duration::from_millis(500)).await;
+    // Wait for server to be ready (poll, not sleep)
+    wait_for_server_ready(test_port, Duration::from_secs(2)).await?;
 
     // Start client daemon in background
     let client_output_path = client_output_dir.path().to_path_buf();
@@ -234,18 +261,15 @@ async fn test_watch_sync_integration() -> Result<()> {
     // Set up watch with *.txt files
     setup_watch(&fixture, vec!["*.txt".to_string()], vec![]).await?;
 
-    // Give the watch time to be fully set up
-    sleep(Duration::from_millis(500)).await;
-
     // Create a test file in the watched directory
     let test_file_path = fixture.server_watch_dir.path().join("test.txt");
     let test_content = "Hello from watch sync test!";
     std::fs::write(&test_file_path, test_content)?;
     log::info!("Created test file: {}", test_file_path.display());
 
-    // Wait for file to be synced (with timeout)
+    // Wait for file to sync and debouncer to settle
     let synced_file_path = fixture.client_output_dir.path().join("test.txt");
-    wait_for_file_content(&synced_file_path, test_content, Duration::from_millis(500)).await?;
+    wait_for_sync_and_settle(&synced_file_path, test_content, Duration::from_secs(2)).await?;
 
     log::info!("✓ File successfully synced with correct content!");
 
@@ -254,8 +278,8 @@ async fn test_watch_sync_integration() -> Result<()> {
     std::fs::write(&test_file_path, updated_content)?;
     log::info!("Updated test file");
 
-    // Wait for updated content to be synced
-    wait_for_file_content(&synced_file_path, updated_content, Duration::from_millis(500)).await?;
+    // Wait for updated content to sync and settle
+    wait_for_sync_and_settle(&synced_file_path, updated_content, Duration::from_secs(2)).await?;
 
     log::info!("✓ File update successfully synced!");
 
@@ -284,22 +308,19 @@ async fn test_watch_with_subdirectories() -> Result<()> {
     // Set up recursive watch
     setup_watch(&fixture, vec!["*.txt".to_string()], vec![]).await?;
 
-    // Give the watch time to be fully set up
-    sleep(Duration::from_millis(500)).await;
-
     // Create file in subdirectory
     let test_file = subdir.join("nested.txt");
     let test_content = "nested content";
     std::fs::write(&test_file, test_content)?;
     log::info!("Created nested file: {}", test_file.display());
 
-    // Wait for nested file to be synced (longer timeout for nested paths)
+    // Wait for nested file to sync and settle
     let synced_nested = fixture
         .client_output_dir
         .path()
         .join("subdir")
         .join("nested.txt");
-    wait_for_file_content(&synced_nested, test_content, Duration::from_millis(500)).await?;
+    wait_for_sync_and_settle(&synced_nested, test_content, Duration::from_secs(2)).await?;
 
     log::info!("✓ Nested file successfully synced!");
 
@@ -343,17 +364,14 @@ async fn test_watch_single_file() -> Result<()> {
         _ => anyhow::bail!("Unexpected response: {:?}", response),
     }
 
-    // Give the watch time to be fully set up
-    sleep(Duration::from_millis(500)).await;
-
     // Modify the watched file
     let updated_content = "version 2.0";
     std::fs::write(&watched_file, updated_content)?;
     log::info!("Updated watched file");
 
-    // Wait for file to be synced
+    // Wait for file to sync and debouncer to settle
     let synced_file_path = fixture.client_output_dir.path().join("specific.exe");
-    wait_for_file_content(&synced_file_path, updated_content, Duration::from_millis(500)).await?;
+    wait_for_sync_and_settle(&synced_file_path, updated_content, Duration::from_secs(2)).await?;
 
     log::info!("✓ Single file successfully synced with correct content!");
 
@@ -368,15 +386,12 @@ async fn test_watch_single_file() -> Result<()> {
 
     log::info!("✓ Other files in directory correctly not synced!");
 
-    // Give debouncer time to settle before next write
-    sleep(Duration::from_millis(200)).await;
-
     // Update the watched file again to ensure watch is still active
     let final_content = "version 3.0";
     std::fs::write(&watched_file, final_content)?;
     log::info!("Updated watched file again");
 
-    wait_for_file_content(&synced_file_path, final_content, Duration::from_secs(2)).await?;
+    wait_for_sync_and_settle(&synced_file_path, final_content, Duration::from_secs(2)).await?;
 
     log::info!("✓ Single file watch remains active after multiple updates!");
 

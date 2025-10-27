@@ -133,11 +133,21 @@ impl FileWatcher {
                     Ok(events) => {
                         let watches = watches_clone.lock().unwrap();
 
+                        // Deduplicate events by path - cargo/build tools often generate
+                        // multiple events (write, chmod, metadata) for the same file
+                        let mut seen_paths = std::collections::HashSet::new();
+
                         for event in events {
                             let path = event.path;
 
                             // Only process regular files
                             if !path.is_file() {
+                                continue;
+                            }
+
+                            // Skip if we've already processed this path in this batch
+                            if !seen_paths.insert(path.clone()) {
+                                log::trace!("Skipping duplicate event for: {}", path.display());
                                 continue;
                             }
 
