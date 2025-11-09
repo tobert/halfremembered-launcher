@@ -35,6 +35,7 @@ pub struct SshServer {
     rsync_file_storage: RsyncFileStorage,
     execute_metadata: ExecuteMetadataStorage,
     file_watcher: FileWatcherRef,
+    sync_rules: Arc<Mutex<Option<(PathBuf, Vec<crate::config::SyncRule>)>>>, // (project_root, rules)
     start_time: Arc<Instant>,
     rsync_semaphore: Arc<tokio::sync::Semaphore>,
 }
@@ -52,6 +53,7 @@ impl SshServer {
             rsync_file_storage: Arc::new(Mutex::new(HashMap::new())),
             execute_metadata: Arc::new(Mutex::new(HashMap::new())),
             file_watcher: Arc::new(Mutex::new(None)),
+            sync_rules: Arc::new(Mutex::new(None)),
             start_time: Arc::new(Instant::now()),
             rsync_semaphore: Arc::new(tokio::sync::Semaphore::new(5)), // Limit to 5 concurrent rsyncs
         })
@@ -120,9 +122,14 @@ impl SshServer {
 
                 log::info!("📁 Project root: {}", project_root.display());
 
+                // Store sync rules for later lookup in callback
+                *server.sync_rules.lock().await = Some((project_root.clone(), config.sync_rules.clone()));
+
                 // Set up watches for each sync rule
                 let registry = server.client_registry.clone();
                 let storage = server.rsync_file_storage.clone();
+                let exec_metadata = server.execute_metadata.clone();
+                let sync_rules = server.sync_rules.clone();
                 let semaphore = server.rsync_semaphore.clone();
                 let runtime_handle = tokio::runtime::Handle::current();
 
@@ -131,6 +138,8 @@ impl SshServer {
                 let callback = move |_watch_root: PathBuf, relative: PathBuf, absolute: PathBuf| {
                     let registry = registry.clone();
                     let storage = storage.clone();
+                    let exec_metadata = exec_metadata.clone();
+                    let sync_rules = sync_rules.clone();
                     let semaphore = semaphore.clone();
                     let relative_str = relative.to_string_lossy().to_string();
 
@@ -142,12 +151,56 @@ impl SshServer {
                         let _permit = semaphore.acquire().await.unwrap();
                         log::debug!("Acquired semaphore permit for {}", absolute.display());
 
-                        if let Err(e) = Self::sync_file_to_clients(
-                            &absolute.to_string_lossy(),
-                            &relative_str,
-                            registry,
-                            storage,
-                        ).await {
+                        // Find which sync rule matches this file to get execute config
+                        let exec_config = {
+                            let rules_lock = sync_rules.lock().await;
+                            if let Some((project_root, rules)) = rules_lock.as_ref() {
+                                // Find the first rule that matches this file
+                                rules.iter().find(|rule| {
+                                    // Check if file matches this rule's include patterns
+                                    use globset::{Glob, GlobSetBuilder};
+                                    let mut builder = GlobSetBuilder::new();
+                                    for pattern in &rule.include {
+                                        if let Ok(glob) = Glob::new(pattern) {
+                                            builder.add(glob);
+                                        }
+                                    }
+                                    if let Ok(set) = builder.build() {
+                                        if let Ok(rel) = absolute.strip_prefix(project_root) {
+                                            set.is_match(rel)
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                }).and_then(|rule| rule.execute.clone())
+                            } else {
+                                None
+                            }
+                        };
+
+                        // Sync with or without execute config
+                        let result = if let Some(config) = exec_config {
+                            log::debug!("File has execute config: {}", config.command);
+                            Self::sync_file_to_clients_with_exec(
+                                &absolute.to_string_lossy(),
+                                &relative_str,
+                                registry,
+                                storage,
+                                exec_metadata,
+                                Some(config),
+                            ).await
+                        } else {
+                            Self::sync_file_to_clients(
+                                &absolute.to_string_lossy(),
+                                &relative_str,
+                                registry,
+                                storage,
+                            ).await
+                        };
+
+                        if let Err(e) = result {
                             log::error!("Failed to sync changed file: {:#}", e);
                         }
 
@@ -804,6 +857,7 @@ impl russh::server::Server for SshServer {
             rsync_file_storage: self.rsync_file_storage.clone(),
             execute_metadata: self.execute_metadata.clone(),
             file_watcher: self.file_watcher.clone(),
+            sync_rules: self.sync_rules.clone(),
             start_time: self.start_time.clone(),
             rsync_semaphore: self.rsync_semaphore.clone(),
         }
@@ -846,6 +900,7 @@ pub struct SshSession {
     rsync_file_storage: RsyncFileStorage,
     execute_metadata: ExecuteMetadataStorage,
     file_watcher: FileWatcherRef,
+    sync_rules: Arc<Mutex<Option<(PathBuf, Vec<crate::config::SyncRule>)>>>,
     start_time: Arc<Instant>,
     rsync_semaphore: Arc<tokio::sync::Semaphore>,
 }
