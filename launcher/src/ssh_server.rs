@@ -703,6 +703,19 @@ impl SshServer {
             .context("Invalid mtime")?
             .as_secs();
 
+        // Get file permissions (Unix mode)
+        let mode = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode()
+            }
+            #[cfg(not(unix))]
+            {
+                0o644_u32 // Default permissions for non-Unix platforms
+            }
+        };
+
         // Compute checksum
         let checksum = rsync_utils::compute_checksum(&file_data);
 
@@ -726,6 +739,7 @@ impl SshServer {
             checksum,
             mtime,
             block_size,
+            mode,
         };
 
         let (client_count, client_ids) = {
@@ -801,6 +815,19 @@ impl SshServer {
             .context("Invalid mtime")?
             .as_secs();
 
+        // Get file permissions (Unix mode)
+        let mode = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode()
+            }
+            #[cfg(not(unix))]
+            {
+                0o644_u32 // Default permissions for non-Unix platforms
+            }
+        };
+
         // Compute checksum
         let checksum = rsync_utils::compute_checksum(&file_data);
 
@@ -823,6 +850,7 @@ impl SshServer {
             checksum,
             mtime,
             block_size,
+            mode,
         };
 
         // Store file data for rsync operations with just this client
@@ -882,6 +910,19 @@ impl SshServer {
             .context("Invalid mtime")?
             .as_secs();
 
+        // Get file permissions (Unix mode)
+        let mode = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode()
+            }
+            #[cfg(not(unix))]
+            {
+                0o644_u32 // Default permissions for non-Unix platforms
+            }
+        };
+
         // Compute checksum
         let checksum = rsync_utils::compute_checksum(&file_data);
 
@@ -904,6 +945,7 @@ impl SshServer {
             checksum,
             mtime,
             block_size,
+            mode,
         };
 
         // Store file data for rsync operations with just this client

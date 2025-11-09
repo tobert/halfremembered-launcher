@@ -66,6 +66,7 @@ pub enum ServerMessage {
         checksum: String,
         mtime: u64,
         block_size: u32,
+        mode: u32, // Unix file permissions (ignored on non-Unix platforms)
     },
     Execute {
         request_id: String,
@@ -169,6 +170,7 @@ pub struct RsyncStart {
     pub checksum: String,
     pub mtime: u64,
     pub block_size: u32,
+    pub mode: u32, // Unix file permissions (0o755, 0o644, etc.)
 }
 
 /// Client reports sync completion on control channel

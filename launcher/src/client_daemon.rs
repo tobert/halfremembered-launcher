@@ -220,6 +220,7 @@ impl ClientDaemon {
                 checksum,
                 mtime,
                 block_size,
+                mode,
             } => {
                 log::info!(
                     "Rsync request: {} ({} bytes, block_size: {})",
@@ -234,6 +235,7 @@ impl ClientDaemon {
                     checksum,
                     mtime,
                     block_size,
+                    mode,
                 )
                 .await?;
             }
@@ -271,6 +273,7 @@ impl ClientDaemon {
         expected_checksum: String,
         _mtime: u64,
         block_size: u32,
+        mode: u32,
     ) -> Result<()> {
         log::info!("Rsync start: {} (block_size: {})", relative_path, block_size);
 
@@ -394,23 +397,20 @@ impl ClientDaemon {
                 .await
                 .context("Failed to write file")?;
 
-            // Make executable if it's a binary
-            if local_path.extension().is_none()
-                || local_path
-                    .to_str()
-                    .unwrap_or("")
-                    .contains("target/release/")
+            // Apply file permissions from server
+            #[cfg(unix)]
             {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let metadata = tokio::fs::metadata(&local_path).await?;
-                    let mut permissions = metadata.permissions();
-                    permissions.set_mode(permissions.mode() | 0o111);
-                    tokio::fs::set_permissions(&local_path, permissions)
-                        .await
-                        .context("Failed to set executable permission")?;
-                }
+                use std::os::unix::fs::PermissionsExt;
+                let permissions = std::fs::Permissions::from_mode(mode);
+                tokio::fs::set_permissions(&local_path, permissions)
+                    .await
+                    .context("Failed to set file permissions")?;
+                log::debug!("Set permissions {:o} on {}", mode, relative_path);
+            }
+            #[cfg(not(unix))]
+            {
+                // Windows doesn't use Unix permissions, so we just log it
+                log::trace!("Ignoring Unix permissions {:o} on Windows", mode);
             }
 
             let elapsed = start_time.elapsed();
