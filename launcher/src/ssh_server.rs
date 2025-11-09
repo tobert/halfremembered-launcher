@@ -840,6 +840,96 @@ impl SshServer {
         Ok(())
     }
 
+    /// Sync a file to a specific client with execute config
+    async fn sync_file_to_client_with_exec(
+        file_path: &str,
+        destination: &str,
+        hostname: &str,
+        session_id: &str,
+        registry: Arc<Mutex<ClientRegistry>>,
+        rsync_storage: RsyncFileStorage,
+        exec_metadata: ExecuteMetadataStorage,
+        exec_config: Option<crate::config::ExecuteConfig>,
+    ) -> Result<()> {
+        log::debug!("sync_file_to_client_with_exec called: {} -> {} (client: {})", file_path, destination, hostname);
+
+        let path = Path::new(file_path);
+
+        if !path.exists() {
+            log::error!("File not found: {}", file_path);
+            anyhow::bail!("File not found: {}", file_path);
+        }
+
+        log::debug!("File exists, proceeding with sync: {}", file_path);
+
+        // Open file, mmap it, and immediately close the file handle
+        let file_data = {
+            let file = std::fs::File::open(&path).context("Failed to open file")?;
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            Arc::new(mmap)
+        };
+
+        // Read file and compute metadata
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .context("Failed to read file metadata")?;
+
+        let size = metadata.len();
+        let mtime = metadata
+            .modified()
+            .context("Failed to get file mtime")?
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("Invalid mtime")?
+            .as_secs();
+
+        // Compute checksum
+        let checksum = rsync_utils::compute_checksum(&file_data);
+
+        // Choose block size
+        let block_size = rsync_utils::choose_block_size(size);
+
+        log::debug!(
+            "Syncing {} ({} bytes) to client {} via rsync with execute config",
+            file_path,
+            size,
+            hostname
+        );
+
+        // Send to specific client
+        let request_id = format!("rsync-{}", uuid::Uuid::new_v4());
+        let rsync_msg = ServerMessage::RsyncStart {
+            request_id: request_id.clone(),
+            relative_path: destination.to_string(),
+            size,
+            checksum,
+            mtime,
+            block_size,
+        };
+
+        // Store file data for rsync operations with just this client
+        let mut client_ids = HashSet::new();
+        client_ids.insert(session_id.to_string());
+
+        rsync_storage.lock().await.insert(
+            request_id.clone(),
+            (path.to_path_buf(), file_data, client_ids),
+        );
+
+        // Store execute metadata if provided
+        if let Some(config) = exec_config {
+            exec_metadata.lock().await.insert(
+                request_id.clone(),
+                (destination.to_string(), config),
+            );
+            log::debug!("Stored execute metadata for request: {}", request_id);
+        }
+
+        registry.lock().await.send_to_client(hostname, &rsync_msg).await?;
+
+        log::trace!("Sent rsync start for {} to {}", file_path, hostname);
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn get_registry(&self) -> Arc<Mutex<ClientRegistry>> {
         self.client_registry.clone()
@@ -1107,14 +1197,51 @@ impl SshSession {
                             hostname
                         );
 
-                        for (idx, (_watch_root, relative_path, absolute_path)) in watched_files.iter().enumerate() {
-                            let file_path_str = absolute_path.to_string_lossy().to_string();
-                            let dest_str = relative_path.to_string_lossy().to_string();
+                        // Get sync rules for destination path construction
+                        let sync_rules = self.sync_rules.lock().await.clone();
 
-                            log::info!("Queueing file {}/{}: {} ({})", idx + 1, file_count, file_path_str, dest_str);
+                        for (idx, (watch_root, relative_path, absolute_path)) in watched_files.iter().enumerate() {
+                            let file_path_str = absolute_path.to_string_lossy().to_string();
+                            let relative_str = relative_path.to_string_lossy().to_string();
+
+                            // Find matching sync rule to get destination and execute config
+                            let (destination_path, exec_config) = if let Some((project_root, rules)) = &sync_rules {
+                                let matched_rule = rules.iter().find(|rule| {
+                                    use globset::{Glob, GlobSetBuilder};
+                                    let mut builder = GlobSetBuilder::new();
+                                    for pattern in &rule.include {
+                                        if let Ok(glob) = Glob::new(pattern) {
+                                            builder.add(glob);
+                                        }
+                                    }
+                                    if let Ok(set) = builder.build() {
+                                        if let Ok(rel) = absolute_path.strip_prefix(project_root) {
+                                            set.is_match(rel)
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                });
+
+                                if let Some(rule) = matched_rule {
+                                    let dest = std::path::PathBuf::from(&rule.destination);
+                                    let full_dest = dest.join(&relative_str);
+                                    let dest_str = full_dest.to_string_lossy().to_string();
+                                    (dest_str, rule.execute.clone())
+                                } else {
+                                    (relative_str.clone(), None)
+                                }
+                            } else {
+                                (relative_str.clone(), None)
+                            };
+
+                            log::info!("Queueing file {}/{}: {} -> {}", idx + 1, file_count, file_path_str, destination_path);
 
                             let registry_clone = self.client_registry.clone();
                             let storage_clone = self.rsync_file_storage.clone();
+                            let exec_metadata_clone = self.execute_metadata.clone();
                             let semaphore_clone = self.rsync_semaphore.clone();
                             let hostname_clone = hostname.clone();
                             let session_id_clone = self.session_id.clone();
@@ -1128,16 +1255,30 @@ impl SshSession {
                                 let _permit = semaphore_clone.acquire().await.unwrap();
                                 log::debug!("Initial sync starting: {}", file_path_str);
 
-                                if let Err(e) = SshServer::sync_file_to_client(
-                                    &file_path_str,
-                                    &dest_str,
-                                    &hostname_clone,
-                                    &session_id_clone,
-                                    registry_clone,
-                                    storage_clone,
-                                )
-                                .await
-                                {
+                                let result = if exec_config.is_some() {
+                                    log::debug!("Initial sync with execute config: {}", file_path_str);
+                                    SshServer::sync_file_to_client_with_exec(
+                                        &file_path_str,
+                                        &destination_path,
+                                        &hostname_clone,
+                                        &session_id_clone,
+                                        registry_clone,
+                                        storage_clone,
+                                        exec_metadata_clone,
+                                        exec_config,
+                                    ).await
+                                } else {
+                                    SshServer::sync_file_to_client(
+                                        &file_path_str,
+                                        &destination_path,
+                                        &hostname_clone,
+                                        &session_id_clone,
+                                        registry_clone,
+                                        storage_clone,
+                                    ).await
+                                };
+
+                                if let Err(e) = result {
                                     log::error!(
                                         "Failed to sync {} to {}: {:#}",
                                         file_path_str,
