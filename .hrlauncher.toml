@@ -1,0 +1,27 @@
+# HalfRemembered Launcher - Self-Deployment Configuration
+#
+# This config enables the launcher to build and sync itself to client machines.
+# Perfect for development and bootstrapping new machines.
+
+[project]
+name = "halfremembered-launcher"
+description = "Self-deploying launcher binaries to client machines"
+
+# Linux binaries - sync to Linux/WSL clients
+[[sync]]
+name = "linux-binary"
+include = ["target/release/halfremembered-launcher"]
+exclude = ["**/*.d"]
+destination = "."
+
+# Windows binaries - sync to Windows/WSL clients
+[[sync]]
+name = "windows-binary"
+include = ["target/x86_64-pc-windows-gnu/release/halfremembered-launcher.exe"]
+destination = "."
+
+# Config files for reference
+[[sync]]
+name = "config-files"
+include = [".hrlauncher.toml", "CONFIG.md", "CLAUDE.md"]
+destination = "."
