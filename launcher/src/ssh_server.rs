@@ -151,12 +151,12 @@ impl SshServer {
                         let _permit = semaphore.acquire().await.unwrap();
                         log::debug!("Acquired semaphore permit for {}", absolute.display());
 
-                        // Find which sync rule matches this file to get execute config
-                        let exec_config = {
+                        // Find which sync rule matches this file to get destination and execute config
+                        let (destination_path, exec_config) = {
                             let rules_lock = sync_rules.lock().await;
                             if let Some((project_root, rules)) = rules_lock.as_ref() {
                                 // Find the first rule that matches this file
-                                rules.iter().find(|rule| {
+                                let matched_rule = rules.iter().find(|rule| {
                                     // Check if file matches this rule's include patterns
                                     use globset::{Glob, GlobSetBuilder};
                                     let mut builder = GlobSetBuilder::new();
@@ -174,9 +174,21 @@ impl SshServer {
                                     } else {
                                         false
                                     }
-                                }).and_then(|rule| rule.execute.clone())
+                                });
+
+                                if let Some(rule) = matched_rule {
+                                    // Construct destination by joining rule's destination with the relative path
+                                    let dest = std::path::PathBuf::from(&rule.destination);
+                                    let full_dest = dest.join(&relative_str);
+                                    let dest_str = full_dest.to_string_lossy().to_string();
+                                    (dest_str, rule.execute.clone())
+                                } else {
+                                    // No matching rule, use relative path as-is
+                                    (relative_str.clone(), None)
+                                }
                             } else {
-                                None
+                                // No sync rules configured, use relative path as-is
+                                (relative_str.clone(), None)
                             }
                         };
 
@@ -185,7 +197,7 @@ impl SshServer {
                             log::debug!("File has execute config: {}", config.command);
                             Self::sync_file_to_clients_with_exec(
                                 &absolute.to_string_lossy(),
-                                &relative_str,
+                                &destination_path,
                                 registry,
                                 storage,
                                 exec_metadata,
@@ -194,7 +206,7 @@ impl SshServer {
                         } else {
                             Self::sync_file_to_clients(
                                 &absolute.to_string_lossy(),
-                                &relative_str,
+                                &destination_path,
                                 registry,
                                 storage,
                             ).await
