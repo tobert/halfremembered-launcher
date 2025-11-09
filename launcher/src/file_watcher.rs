@@ -181,20 +181,18 @@ impl FileWatcher {
                                 let mut states = file_states_clone.lock().unwrap();
                                 if let Some(state) = states.get_mut(&path) {
                                     if state.last_checksum == current_checksum {
-                                        log::debug!("⏭️  Skipping {} (checksum unchanged: {})", path.display(), &current_checksum[..8]);
+                                        log::trace!("⏭️  Skipping {} (checksum unchanged: {})", path.display(), &current_checksum[..8]);
                                         state.last_event_time = Instant::now();
                                         false
                                     } else {
-                                        log::info!("📝 File changed: {} (checksum: {} → {})", path.display(), &state.last_checksum[..8], &current_checksum[..8]);
                                         state.last_event_time = Instant::now();
-                                        state.last_checksum = current_checksum;
+                                        state.last_checksum = current_checksum.clone();
                                         true
                                     }
                                 } else {
-                                    log::info!("📝 New file: {} (checksum: {})", path.display(), &current_checksum[..8]);
                                     states.insert(path.clone(), FileState {
                                         last_event_time: Instant::now(),
-                                        last_checksum: current_checksum,
+                                        last_checksum: current_checksum.clone(),
                                     });
                                     true
                                 }
@@ -204,10 +202,13 @@ impl FileWatcher {
                                 continue;
                             }
 
-                            // All filters passed - find matching watches and invoke callback
+                            // Check if file matches any watch pattern before logging/syncing
                             let watches = watches_clone.lock().unwrap();
+                            let mut matched = false;
                             for (watch_root, config) in watches.iter() {
                                 if config.matches(&path) {
+                                    matched = true;
+
                                     // Compute relative path using config.path (not watch_root key)
                                     // For single files, watch_root is the file itself, but config.path is the parent
                                     let relative = match path.strip_prefix(&config.path) {
@@ -215,9 +216,22 @@ impl FileWatcher {
                                         Err(_) => continue,
                                     };
 
+                                    // Log only files that match patterns
+                                    let states = file_states_clone.lock().unwrap();
+                                    if let Some(state) = states.get(&path) {
+                                        log::info!("📝 File changed: {} (checksum: {} → {})", path.display(), &state.last_checksum[..8], &current_checksum[..8]);
+                                    } else {
+                                        log::info!("📝 New file: {} (checksum: {})", path.display(), &current_checksum[..8]);
+                                    }
+
                                     // Call the sync callback
                                     on_change(watch_root.clone(), relative, path.clone());
+                                    break; // Only process once per file
                                 }
+                            }
+
+                            if !matched {
+                                log::trace!("⏭️  Skipping {} (no matching patterns)", path.display());
                             }
                         }
                     }

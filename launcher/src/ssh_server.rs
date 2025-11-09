@@ -32,6 +32,7 @@ pub struct SshServer {
     rsync_file_storage: RsyncFileStorage,
     file_watcher: FileWatcherRef,
     start_time: Arc<Instant>,
+    rsync_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl SshServer {
@@ -47,6 +48,7 @@ impl SshServer {
             rsync_file_storage: Arc::new(Mutex::new(HashMap::new())),
             file_watcher: Arc::new(Mutex::new(None)),
             start_time: Arc::new(Instant::now()),
+            rsync_semaphore: Arc::new(tokio::sync::Semaphore::new(5)), // Limit to 5 concurrent rsyncs
         })
     }
 
@@ -116,6 +118,7 @@ impl SshServer {
                 // Set up watches for each sync rule
                 let registry = server.client_registry.clone();
                 let storage = server.rsync_file_storage.clone();
+                let semaphore = server.rsync_semaphore.clone();
                 let runtime_handle = tokio::runtime::Handle::current();
 
                 // Create callback for file changes
@@ -123,11 +126,17 @@ impl SshServer {
                 let callback = move |_watch_root: PathBuf, relative: PathBuf, absolute: PathBuf| {
                     let registry = registry.clone();
                     let storage = storage.clone();
+                    let semaphore = semaphore.clone();
                     let relative_str = relative.to_string_lossy().to_string();
 
-                    log::info!("🔄 Syncing {} to clients", absolute.display());
-
                     runtime_handle.spawn(async move {
+                        let available = semaphore.available_permits();
+                        log::info!("🔄 Syncing {} to clients (semaphore: {} available)", absolute.display(), available);
+
+                        // Acquire semaphore to limit concurrent syncs
+                        let _permit = semaphore.acquire().await.unwrap();
+                        log::debug!("Acquired semaphore permit for {}", absolute.display());
+
                         if let Err(e) = Self::sync_file_to_clients(
                             &absolute.to_string_lossy(),
                             &relative_str,
@@ -136,6 +145,8 @@ impl SshServer {
                         ).await {
                             log::error!("Failed to sync changed file: {:#}", e);
                         }
+
+                        log::debug!("Released semaphore permit for {}", absolute.display());
                     });
                 };
 
@@ -219,6 +230,7 @@ impl SshServer {
         rsync_storage: RsyncFileStorage,
         file_watcher: FileWatcherRef,
         start_time: Arc<Instant>,
+        rsync_semaphore: Arc<tokio::sync::Semaphore>,
     ) -> LocalResponse {
         match command {
             LocalCommand::Ping { target } => {
@@ -387,6 +399,7 @@ impl SshServer {
                 if watcher_lock.is_none() {
                     let registry_clone = registry.clone();
                     let storage_clone = rsync_storage.clone();
+                    let semaphore_clone = rsync_semaphore.clone();
 
                     // Get a handle to the current tokio runtime
                     let runtime_handle = tokio::runtime::Handle::current();
@@ -397,12 +410,18 @@ impl SshServer {
                         move |_watch_root: PathBuf, relative: PathBuf, absolute: PathBuf| {
                             let registry = registry_clone.clone();
                             let storage = storage_clone.clone();
+                            let semaphore = semaphore_clone.clone();
                             let relative_str = relative.to_string_lossy().to_string();
-
-                            log::info!("🔄 Syncing {} to clients", absolute.display());
 
                             // Spawn on the tokio runtime from the std::thread callback
                             runtime_handle.spawn(async move {
+                                let available = semaphore.available_permits();
+                                log::info!("🔄 Syncing {} to clients (semaphore: {} available)", absolute.display(), available);
+
+                                // Acquire semaphore to limit concurrent syncs
+                                let _permit = semaphore.acquire().await.unwrap();
+                                log::debug!("Acquired semaphore permit for {}", absolute.display());
+
                                 if let Err(e) = Self::sync_file_to_clients(
                                     &absolute.to_string_lossy(),
                                     &relative_str,
@@ -413,6 +432,8 @@ impl SshServer {
                                 {
                                     log::error!("Failed to sync changed file: {:#}", e);
                                 }
+
+                                log::debug!("Released semaphore permit for {}", absolute.display());
                             });
                         };
 
@@ -631,11 +652,16 @@ impl SshServer {
         registry: Arc<Mutex<ClientRegistry>>,
         rsync_storage: RsyncFileStorage,
     ) -> Result<()> {
+        log::debug!("sync_file_to_client called: {} -> {} (client: {})", file_path, destination, hostname);
+
         let path = Path::new(file_path);
 
         if !path.exists() {
+            log::error!("File not found: {}", file_path);
             anyhow::bail!("File not found: {}", file_path);
         }
+
+        log::debug!("File exists, proceeding with sync: {}", file_path);
 
         // Open file, mmap it, and immediately close the file handle
         let file_data = {
@@ -725,6 +751,7 @@ impl russh::server::Server for SshServer {
             rsync_file_storage: self.rsync_file_storage.clone(),
             file_watcher: self.file_watcher.clone(),
             start_time: self.start_time.clone(),
+            rsync_semaphore: self.rsync_semaphore.clone(),
         }
     }
 }
@@ -765,6 +792,7 @@ pub struct SshSession {
     rsync_file_storage: RsyncFileStorage,
     file_watcher: FileWatcherRef,
     start_time: Arc<Instant>,
+    rsync_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl russh::server::Handler for SshSession {
@@ -957,17 +985,27 @@ impl SshSession {
                             hostname
                         );
 
-                        for (_watch_root, relative_path, absolute_path) in watched_files {
+                        for (idx, (_watch_root, relative_path, absolute_path)) in watched_files.iter().enumerate() {
                             let file_path_str = absolute_path.to_string_lossy().to_string();
                             let dest_str = relative_path.to_string_lossy().to_string();
 
+                            log::info!("Queueing file {}/{}: {} ({})", idx + 1, file_count, file_path_str, dest_str);
+
                             let registry_clone = self.client_registry.clone();
                             let storage_clone = self.rsync_file_storage.clone();
+                            let semaphore_clone = self.rsync_semaphore.clone();
                             let hostname_clone = hostname.clone();
                             let session_id_clone = self.session_id.clone();
 
                             // Spawn sync task to avoid blocking registration
                             tokio::spawn(async move {
+                                let available = semaphore_clone.available_permits();
+                                log::debug!("Initial sync queued: {} (semaphore: {} available)", file_path_str, available);
+
+                                // Acquire semaphore to limit concurrent syncs
+                                let _permit = semaphore_clone.acquire().await.unwrap();
+                                log::debug!("Initial sync starting: {}", file_path_str);
+
                                 if let Err(e) = SshServer::sync_file_to_client(
                                     &file_path_str,
                                     &dest_str,
@@ -985,6 +1023,8 @@ impl SshSession {
                                         e
                                     );
                                 }
+
+                                log::debug!("Initial sync completed: {}", file_path_str);
                             });
                         }
 
@@ -1109,6 +1149,7 @@ impl SshSession {
             self.rsync_file_storage.clone(),
             self.file_watcher.clone(),
             self.start_time.clone(),
+            self.rsync_semaphore.clone(),
         )
         .await;
 
@@ -1219,24 +1260,77 @@ impl SshSession {
 
                         log::debug!("Generated delta: {} bytes", delta.len());
 
-                        // Send delta frame
-                        let delta_frame = Frame::new(MSG_RSYNC_DELTA, delta);
-                        let mut buffer = Vec::new();
-                        delta_frame.write(&mut buffer).map_err(|e| {
-                            russh::Error::from(std::io::Error::other(format!(
-                                "Failed to write frame: {:#}",
-                                e
-                            )))
-                        })?;
+                        // Send delta frame in chunks to avoid exceeding SSH window size
+                        const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
 
-                        let _ = session.data(channel, buffer.into());
-                        log::debug!("Sent delta frame on channel {:?}", channel);
+                        let delta_len = delta.len();
 
-                        // Close the rsync channel
-                        let _ = session.eof(channel);
-                        log::debug!("Closed rsync channel {:?}", channel);
+                        if delta_len <= CHUNK_SIZE {
+                            // Small delta - send as single frame
+                            let delta_frame = Frame::new(MSG_RSYNC_DELTA, delta);
+                            let mut buffer = Vec::new();
+                            delta_frame.write(&mut buffer).map_err(|e| {
+                                russh::Error::from(std::io::Error::other(format!(
+                                    "Failed to write frame: {:#}",
+                                    e
+                                )))
+                            })?;
 
-                        // Mark for removal
+                            let _ = session.data(channel, buffer.into());
+                            log::debug!("Sent delta frame on channel {:?} ({} bytes)", channel, delta_len);
+
+                            // Send zero-length frame to signal end of delta stream
+                            let end_frame = Frame::new(MSG_RSYNC_DELTA, Vec::new());
+                            let mut end_buffer = Vec::new();
+                            end_frame.write(&mut end_buffer).map_err(|e| {
+                                russh::Error::from(std::io::Error::other(format!(
+                                    "Failed to write end frame: {:#}",
+                                    e
+                                )))
+                            })?;
+                            let _ = session.data(channel, end_buffer.into());
+                            log::debug!("Sent end-of-delta marker on channel {:?}", channel);
+                        } else {
+                            // Large delta - chunk it
+                            let num_chunks = (delta_len + CHUNK_SIZE - 1) / CHUNK_SIZE;
+                            log::debug!("Chunking large delta: {} bytes into {} byte chunks ({} chunks total)",
+                                delta_len, CHUNK_SIZE, num_chunks);
+
+                            for (chunk_idx, chunk) in delta.chunks(CHUNK_SIZE).enumerate() {
+                                let delta_frame = Frame::new(MSG_RSYNC_DELTA, chunk.to_vec());
+                                let mut buffer = Vec::new();
+                                delta_frame.write(&mut buffer).map_err(|e| {
+                                    russh::Error::from(std::io::Error::other(format!(
+                                        "Failed to write frame chunk {}: {:#}",
+                                        chunk_idx,
+                                        e
+                                    )))
+                                })?;
+
+                                let _ = session.data(channel, buffer.into());
+                                log::trace!("Sent delta chunk {}/{} ({} bytes)",
+                                    chunk_idx + 1,
+                                    num_chunks,
+                                    chunk.len());
+                            }
+
+                            log::debug!("Sent chunked delta on channel {:?} ({} bytes in {} chunks)",
+                                channel, delta_len, num_chunks);
+
+                            // Send zero-length frame to signal end of delta stream
+                            let end_frame = Frame::new(MSG_RSYNC_DELTA, Vec::new());
+                            let mut end_buffer = Vec::new();
+                            end_frame.write(&mut end_buffer).map_err(|e| {
+                                russh::Error::from(std::io::Error::other(format!(
+                                    "Failed to write end frame: {:#}",
+                                    e
+                                )))
+                            })?;
+                            let _ = session.data(channel, end_buffer.into());
+                            log::debug!("Sent end-of-delta marker on channel {:?}", channel);
+                        }
+
+                        // Mark for removal - client will close channel
                         should_remove_channel = true;
                     }
                 }

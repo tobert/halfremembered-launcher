@@ -13,8 +13,8 @@ The launcher can build and sync itself to client machines.
 ### 1. Build on Your Development Machine
 
 ```bash
-# Build for Linux
-cargo build --release
+# Install Linux binary to ~/.cargo/bin
+cargo install --path launcher
 
 # Optional: Build for Windows (requires cross-compile toolchain)
 rustup target add x86_64-pc-windows-gnu
@@ -28,13 +28,13 @@ rustup target add x86_64-pc-windows-gnu
 ```bash
 # Terminal 1: Start server on build machine
 # The server auto-detects .hrlauncher.toml and configures watches
-./target/release/halfremembered-launcher server
+halfremembered-launcher server
 
 # Get the scp command to run on your client
-echo "scp $USER@$(hostname):$(pwd)/target/release/halfremembered-launcher ~/bin/"
+echo "scp $USER@$(hostname):~/.cargo/bin/halfremembered-launcher ~/.cargo/bin/"
 
 # Terminal 2: On your laptop/client machine, run that scp command, then:
-~/bin/halfremembered-launcher client buildmachine
+halfremembered-launcher client buildmachine
 ```
 
 The included `.hrlauncher.toml` is **automatically loaded** when you start the server. The server walks up from the current directory (like git does) to find the config file and configures watches for all sync rules.

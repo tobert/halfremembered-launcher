@@ -433,10 +433,17 @@ impl SshClientConnection {
     /// Open a dedicated rsync channel
     /// Returns a new channel for rsync data transfer
     pub async fn open_rsync_channel(&self) -> Result<Channel<client::Msg>> {
-        self.session
-            .channel_open_session()
-            .await
-            .context("Failed to open rsync channel")
+        log::debug!("Attempting to open rsync channel...");
+        match self.session.channel_open_session().await {
+            Ok(channel) => {
+                log::debug!("Successfully opened rsync channel");
+                Ok(channel)
+            }
+            Err(e) => {
+                log::error!("Failed to open rsync channel: {:#}", e);
+                Err(anyhow::anyhow!("Failed to open rsync channel: {:#}", e))
+            }
+        }
     }
 
     /// Read a frame from a channel

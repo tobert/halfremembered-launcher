@@ -298,13 +298,15 @@ impl ClientDaemon {
             .as_ref()
             .context("No active connection")?;
 
+        log::debug!("Opening rsync channel for {}", relative_path);
+
         // Open dedicated rsync channel
         let mut rsync_channel = conn_ref
             .open_rsync_channel()
             .await
             .context("Failed to open rsync channel")?;
 
-        log::debug!("Opened rsync channel for {}", relative_path);
+        log::debug!("Successfully opened rsync channel for {}", relative_path);
 
         // Send request_id as handshake
         let handshake_frame = Frame::new(MSG_RSYNC_SIGNATURE, request_id.clone().into_bytes());
@@ -338,20 +340,36 @@ impl ClientDaemon {
 
         log::debug!("Sent signature for {}", relative_path);
 
-        // Receive delta on rsync channel
-        let delta_frame = SshClientConnection::read_frame_from_channel(&mut rsync_channel)
-            .await
-            .context("Failed to receive delta")?;
+        // Receive delta on rsync channel (may be multiple chunks for large files)
+        let mut delta_data = Vec::new();
+        let mut chunk_count = 0;
+        loop {
+            let delta_frame = SshClientConnection::read_frame_from_channel(&mut rsync_channel)
+                .await
+                .context("Failed to receive delta chunk")?;
 
-        if delta_frame.message_type != MSG_RSYNC_DELTA {
-            anyhow::bail!(
-                "Expected delta frame, got message type: {}",
-                delta_frame.message_type
-            );
+            if delta_frame.message_type != MSG_RSYNC_DELTA {
+                anyhow::bail!(
+                    "Expected delta frame, got message type: {}",
+                    delta_frame.message_type
+                );
+            }
+
+            // Zero-length frame signals end of delta stream
+            if delta_frame.payload.is_empty() {
+                log::debug!("Received end-of-delta marker after {} chunks, {} bytes total",
+                    chunk_count, delta_data.len());
+                break;
+            }
+
+            delta_data.extend_from_slice(&delta_frame.payload);
+            chunk_count += 1;
+            log::trace!("Received delta chunk {}: {} bytes (total: {} bytes)",
+                chunk_count, delta_frame.payload.len(), delta_data.len());
         }
 
-        let delta_size = delta_frame.payload.len();
-        log::debug!("Received delta: {} bytes", delta_size);
+        let delta_size = delta_data.len();
+        log::debug!("Received delta: {} bytes total in {} chunks", delta_size, chunk_count);
 
         // Apply delta to produce new file
         let base_path = if local_path.exists() {
@@ -360,7 +378,7 @@ impl ClientDaemon {
             None
         };
 
-        let new_content = rsync_utils::apply_delta(base_path, &delta_frame.payload)
+        let new_content = rsync_utils::apply_delta(base_path, &delta_data)
             .await
             .context("Failed to apply delta")?;
 

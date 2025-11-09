@@ -11,17 +11,12 @@ description = "Self-deploying launcher binaries to client machines"
 [[sync]]
 name = "linux-binary"
 include = ["target/release/halfremembered-launcher"]
-exclude = ["**/*.d"]
-destination = "."
+exclude = ["**/*.d", "**/*.rcgu.o", "**/.fingerprint/**"]
+destination = "~/.cargo/bin/"
 
 # Windows binaries - sync to Windows/WSL clients
 [[sync]]
 name = "windows-binary"
 include = ["target/x86_64-pc-windows-gnu/release/halfremembered-launcher.exe"]
-destination = "."
-
-# Config files for reference
-[[sync]]
-name = "config-files"
-include = [".hrlauncher.toml", "CONFIG.md", "CLAUDE.md"]
-destination = "."
+exclude = ["**/*.d", "**/*.rcgu.o", "**/.fingerprint/**"]
+destination = "~/.cargo/bin/"

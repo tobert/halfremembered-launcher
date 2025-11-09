@@ -1,0 +1,11 @@
+# Cargo configuration for HalfRemembered Launcher
+
+[alias]
+# Install to ~/.cargo/bin
+i = "install --path launcher"
+
+# Quick release build
+rel = "build --release"
+
+# Build for Windows (requires cross-compile toolchain)
+win = "build --release --target x86_64-pc-windows-gnu"
