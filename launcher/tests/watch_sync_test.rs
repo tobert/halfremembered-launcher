@@ -169,6 +169,18 @@ async fn setup_test() -> Result<TestFixture> {
     log::info!("Server watch dir: {}", server_watch_dir.path().display());
     log::info!("Client output dir: {}", client_output_dir.path().display());
 
+    // Create a temporary .hrlauncher.toml for the server to auto-load
+    let config_content = r#"
+[project]
+name = "test-project"
+
+[[sync_rules]]
+name = "all-files"
+include = ["**/*"]
+"#;
+    std::fs::write(server_watch_dir.path().join(".hrlauncher.toml"), config_content)?;
+    log::info!("Created temporary .hrlauncher.toml in server watch dir");
+
     // Use a random high port to avoid conflicts
     let test_port = find_free_port()?;
     log::info!("Using test port: {}", test_port);
@@ -258,9 +270,6 @@ async fn setup_watch(
 async fn test_watch_sync_integration() -> Result<()> {
     let fixture = setup_test().await?;
 
-    // Set up watch with *.txt files
-    setup_watch(&fixture, vec!["*.txt".to_string()], vec![]).await?;
-
     // Create a test file in the watched directory
     let test_file_path = fixture.server_watch_dir.path().join("test.txt");
     let test_content = "Hello from watch sync test!";
@@ -277,6 +286,9 @@ async fn test_watch_sync_integration() -> Result<()> {
     let updated_content = "Updated content from watch sync test!";
     std::fs::write(&test_file_path, updated_content)?;
     log::info!("Updated test file");
+
+    // Wait for updated content to sync and settle
+    wait_for_sync_and_settle(&synced_file_path, updated_content, Duration::from_secs(2)).await?;
 
     // Wait for updated content to sync and settle
     wait_for_sync_and_settle(&synced_file_path, updated_content, Duration::from_secs(2)).await?;
@@ -394,6 +406,69 @@ async fn test_watch_single_file() -> Result<()> {
     wait_for_sync_and_settle(&synced_file_path, final_content, Duration::from_secs(2)).await?;
 
     log::info!("✓ Single file watch remains active after multiple updates!");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_remove_single_file_watch() -> Result<()> {
+    let fixture = setup_test().await?;
+
+    // File to be watched and then un-watched
+    let test_file = fixture.server_watch_dir.path().join("unwatch_me.txt");
+    std::fs::write(&test_file, "content v1")?;
+
+    // Set up the watch
+    let watch_command = halfremembered_protocol::LocalCommand::WatchDirectory {
+        path: test_file.to_string_lossy().to_string(),
+        recursive: false,
+        include_patterns: vec![],
+        exclude_patterns: vec![],
+    };
+    halfremembered_launcher::ssh_client::SshClientConnection::send_control_command(
+        "localhost",
+        fixture.port,
+        &fixture.user,
+        watch_command,
+        None,
+    )
+    .await?;
+    log::info!("Watch added for {}", test_file.display());
+
+    // Verify initial sync
+    let synced_file = fixture.client_output_dir.path().join("unwatch_me.txt");
+    wait_for_sync_and_settle(&synced_file, "content v1", Duration::from_secs(2)).await?;
+    log::info!("✓ Initial sync confirmed");
+
+    // Remove the watch
+    let unwatch_command = halfremembered_protocol::LocalCommand::UnwatchDirectory {
+        path: test_file.to_string_lossy().to_string(),
+    };
+    halfremembered_launcher::ssh_client::SshClientConnection::send_control_command(
+        "localhost",
+        fixture.port,
+        &fixture.user,
+        unwatch_command,
+        None,
+    )
+    .await?;
+    log::info!("Watch removed for {}", test_file.display());
+    sleep(Duration::from_millis(150)).await; // Allow time for server to process unwatch
+
+    // Modify the file AGAIN
+    std::fs::write(&test_file, "content v2 - SHOULD NOT SYNC")?;
+    log::info!("Modified file after unwatching");
+
+    // Verify the modification was NOT synced
+    wait_for_file_absence(
+        &fixture.client_output_dir.path().join("unwatch_me.txt.new"), // rsync writes to .new first
+        Duration::from_secs(2),
+    )
+    .await?;
+    let final_content = std::fs::read_to_string(&synced_file)?;
+    assert_eq!(final_content, "content v1");
+
+    log::info!("✓ File modification was correctly NOT synced after removing watch!");
 
     Ok(())
 }

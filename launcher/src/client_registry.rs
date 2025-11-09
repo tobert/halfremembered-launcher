@@ -9,6 +9,7 @@ pub struct ClientRegistry {
     clients: HashMap<String, ConnectedClient>,
 }
 
+#[derive(Clone)]
 pub struct ConnectedClient {
     pub hostname: String,
     pub session_id: String,
@@ -90,8 +91,8 @@ impl ClientRegistry {
         }
     }
 
-    pub fn list_clients(&self) -> Vec<&ConnectedClient> {
-        self.clients.values().collect()
+    pub fn list_clients(&self) -> Vec<ConnectedClient> {
+        self.clients.values().cloned().collect()
     }
 
     pub fn client_count(&self) -> usize {

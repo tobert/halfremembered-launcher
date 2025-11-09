@@ -164,7 +164,7 @@ impl SshClientConnection {
         Ok(())
     }
 
-    pub async fn send_register(&self, hostname: &str) -> Result<()> {
+    pub async fn send_register(&self, hostname: &str, initial_sync: bool) -> Result<()> {
         let platform = if cfg!(target_os = "windows") {
             "windows"
         } else if cfg!(target_os = "linux") {
@@ -178,6 +178,7 @@ impl SshClientConnection {
         let msg = ClientMessage::Register {
             hostname: hostname.to_string(),
             platform: platform.to_string(),
+            initial_sync,
         };
 
         self.send_message(&msg).await

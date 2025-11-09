@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use halfremembered_protocol::WatchInfo;
 use notify::RecursiveMode;
-use notify_debouncer_mini::{new_debouncer, Debouncer};
+use notify_debouncer_mini::{new_debouncer, Debouncer, DebouncedEventKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -139,6 +139,19 @@ impl FileWatcher {
 
                         for event in events {
                             let path = event.path;
+
+                            // Only process write/modify events, ignore access/metadata changes
+                            // This prevents feedback loops from reading files during sync
+                            match event.kind {
+                                DebouncedEventKind::Any => {
+                                    // Any means modify/write in debounced context
+                                    log::trace!("Processing write event for: {}", path.display());
+                                }
+                                _ => {
+                                    log::trace!("Ignoring non-write event for: {}", path.display());
+                                    continue;
+                                }
+                            }
 
                             // Only process regular files
                             if !path.is_file() {
@@ -286,17 +299,62 @@ impl FileWatcher {
             .canonicalize()
             .context(format!("Failed to canonicalize path: {}", path.display()))?;
 
-        log::info!("Removing watch: {}", canonical.display());
-
-        self._debouncer
-            .watcher()
-            .unwatch(&canonical)
-            .context(format!("Failed to unwatch directory: {}", canonical.display()))?;
+        log::info!("Removing watch for: {}", canonical.display());
 
         let mut watches = self.watches.lock().unwrap();
-        watches.remove(&canonical);
 
-        Ok(())
+        // Find the config for the watch being removed
+        if let Some(config_to_remove) = watches.get(&canonical) {
+            // This is the actual path that was passed to notify::watch
+            let watched_path = if canonical.is_dir() {
+                &canonical
+            } else {
+                // For files, we watched the parent
+                &config_to_remove.path
+            };
+
+            // Before removing the underlying watch, check if any *other* watches
+            // are using the same watched_path. This is crucial for multiple
+            // single-file watches in the same directory.
+            let is_shared = watches.iter().any(|(watch_key, config)| {
+                // Ignore the watch we are about to remove
+                if watch_key == &canonical {
+                    return false;
+                }
+
+                // Determine the underlying watched path for this other watch
+                let other_watched_path = if watch_key.is_dir() {
+                    watch_key
+                } else {
+                    &config.path
+                };
+
+                other_watched_path == watched_path
+            });
+
+            if is_shared {
+                log::debug!(
+                    "Not unwatching {}. It's shared by other watches.",
+                    watched_path.display()
+                );
+            } else {
+                log::debug!("Unwatching {}", watched_path.display());
+                self._debouncer
+                    .watcher()
+                    .unwatch(watched_path)
+                    .context(format!("Failed to unwatch path: {}", watched_path.display()))?;
+            }
+
+            // Always remove the specific watch config from our map
+            watches.remove(&canonical);
+
+            Ok(())
+        } else {
+            // Don't error if watch doesn't exist, just log it.
+            // This can happen in tests or if a remove is duplicated.
+            log::warn!("Watch not found for path: {}", canonical.display());
+            Ok(())
+        }
     }
 
     /// List all active watches
@@ -311,6 +369,103 @@ impl FileWatcher {
                 exclude_patterns: config.exclude_patterns.clone(),
             })
             .collect()
+    }
+
+    /// Get all files currently matching watch patterns
+    ///
+    /// Returns (watch_root, relative_path, absolute_path) for each file.
+    /// This is used for initial sync when a client connects.
+    pub fn get_all_watched_files(&self) -> Vec<(PathBuf, PathBuf, PathBuf)> {
+        let watches = self.watches.lock().unwrap();
+        let mut files = Vec::new();
+
+        for (watch_root, config) in watches.iter() {
+            if watch_root.is_file() {
+                // Single file watch - just return the file itself
+                let relative = match watch_root.strip_prefix(&config.path) {
+                    Ok(rel) => rel.to_path_buf(),
+                    Err(_) => {
+                        log::warn!("Failed to compute relative path for: {}", watch_root.display());
+                        continue;
+                    }
+                };
+                files.push((watch_root.clone(), relative, watch_root.clone()));
+            } else if watch_root.is_dir() {
+                // Directory watch - walk the tree and find matching files
+                let walker = if config.recursive {
+                    walkdir::WalkDir::new(watch_root)
+                } else {
+                    walkdir::WalkDir::new(watch_root).max_depth(1)
+                };
+
+                for entry in walker.into_iter().filter_map(|e| e.ok()) {
+                    let path = entry.path();
+
+                    // Only process files
+                    if !path.is_file() {
+                        continue;
+                    }
+
+                    // Check if it matches the watch config's filters
+                    if config.matches(path) {
+                        let relative = match path.strip_prefix(&config.path) {
+                            Ok(rel) => rel.to_path_buf(),
+                            Err(_) => {
+                                log::warn!("Failed to compute relative path for: {}", path.display());
+                                continue;
+                            }
+                        };
+                        files.push((watch_root.clone(), relative, path.to_path_buf()));
+                    }
+                }
+            }
+        }
+
+        log::debug!("Found {} watched files for initial sync", files.len());
+        files
+    }
+
+    /// Get all files matching a specific watch path
+    pub fn get_files_for_path(&self, path: &Path) -> Vec<(PathBuf, PathBuf, PathBuf)> {
+        let watches = self.watches.lock().unwrap();
+        let mut files = Vec::new();
+
+        if let Some(config) = watches.get(path) {
+            let watch_root = path;
+            if watch_root.is_file() {
+                // Single file watch
+                let relative = match watch_root.strip_prefix(&config.path) {
+                    Ok(rel) => rel.to_path_buf(),
+                    Err(_) => {
+                        log::warn!("Failed to compute relative path for: {}", watch_root.display());
+                        return files;
+                    }
+                };
+                files.push((watch_root.to_path_buf(), relative, watch_root.to_path_buf()));
+            } else if watch_root.is_dir() {
+                // Directory watch
+                let walker = if config.recursive {
+                    walkdir::WalkDir::new(watch_root)
+                } else {
+                    walkdir::WalkDir::new(watch_root).max_depth(1)
+                };
+
+                for entry in walker.into_iter().filter_map(|e| e.ok()) {
+                    let p = entry.path();
+                    if p.is_file() && config.matches(p) {
+                        let relative = match p.strip_prefix(&config.path) {
+                            Ok(rel) => rel.to_path_buf(),
+                            Err(_) => {
+                                log::warn!("Failed to compute relative path for: {}", p.display());
+                                continue;
+                            }
+                        };
+                        files.push((watch_root.to_path_buf(), relative, p.to_path_buf()));
+                    }
+                }
+            }
+        }
+        files
     }
 }
 

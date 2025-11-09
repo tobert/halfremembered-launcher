@@ -42,6 +42,10 @@ enum Commands {
         /// Defaults to SSH_AUTH_SOCK env var on Unix, \\.\pipe\openssh-ssh-agent on Windows
         #[arg(long)]
         agent_socket: Option<String>,
+
+        /// Disable initial sync of watched files on connection
+        #[arg(long, default_value = "false")]
+        no_initial_sync: bool,
     },
 
     /// Send ping to a connected client (server-side command)
@@ -284,6 +288,7 @@ async fn main() -> Result<()> {
             heartbeat,
             reconnect,
             agent_socket,
+            no_initial_sync,
         } => {
             log::info!("Starting HalfRemembered client, connecting to {}", server);
 
@@ -297,7 +302,8 @@ async fn main() -> Result<()> {
             let mut daemon = client_daemon::ClientDaemon::new(host, final_port, user, hostname)
                 .with_heartbeat_interval(std::time::Duration::from_secs(heartbeat))
                 .with_reconnect_delay(std::time::Duration::from_secs(reconnect))
-                .with_agent_socket(agent_socket);
+                .with_agent_socket(agent_socket)
+                .with_initial_sync(!no_initial_sync);
 
             daemon.run().await?;
         }

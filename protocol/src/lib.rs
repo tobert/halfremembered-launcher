@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
+// Default value for initial_sync field (defaults to true for backward compatibility)
+fn default_initial_sync() -> bool {
+    true
+}
+
 // Unified frame protocol
 pub mod frame;
 pub mod message_types;
@@ -17,6 +22,8 @@ pub enum ClientMessage {
     Register {
         hostname: String,
         platform: String,
+        #[serde(default = "default_initial_sync")]
+        initial_sync: bool,
     },
     Heartbeat {
         timestamp: u64,
@@ -689,6 +696,7 @@ mod tests {
         let msg = ClientMessage::Register {
             hostname: "test-host".to_string(),
             platform: "linux".to_string(),
+            initial_sync: true,
         };
 
         let bytes = msg.to_bytes().unwrap();
@@ -698,9 +706,11 @@ mod tests {
             ClientMessage::Register {
                 hostname,
                 platform,
+                initial_sync,
             } => {
                 assert_eq!(hostname, "test-host");
                 assert_eq!(platform, "linux");
+                assert_eq!(initial_sync, true);
             }
             _ => panic!("Wrong message type"),
         }

@@ -19,6 +19,7 @@ pub struct ClientDaemon {
     reconnect_delay: Duration,
     agent_socket: Option<String>,
     working_dir: Option<std::path::PathBuf>,
+    initial_sync: bool,
     shutdown: Arc<AtomicBool>,
     state: Arc<Mutex<ClientState>>,
     connection: Option<SshClientConnection>,
@@ -45,6 +46,7 @@ impl ClientDaemon {
             reconnect_delay: Duration::from_secs(5),
             agent_socket: None,
             working_dir: None,
+            initial_sync: true,
             shutdown: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(ClientState {
                 connected_since,
@@ -73,6 +75,11 @@ impl ClientDaemon {
 
     pub fn with_working_dir(mut self, working_dir: std::path::PathBuf) -> Self {
         self.working_dir = Some(working_dir);
+        self
+    }
+
+    pub fn with_initial_sync(mut self, initial_sync: bool) -> Self {
+        self.initial_sync = initial_sync;
         self
     }
 
@@ -124,7 +131,7 @@ impl ClientDaemon {
         .await?;
 
         connection
-            .send_register(&self.hostname)
+            .send_register(&self.hostname, self.initial_sync)
             .await
             .context("Failed to send registration")?;
 

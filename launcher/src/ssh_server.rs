@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::client_registry::{ClientRegistry, ConnectedClient};
+use crate::config::Config;
 use crate::file_watcher::FileWatcher;
 use crate::rsync_utils;
 
@@ -23,6 +24,7 @@ use crate::rsync_utils;
 type RsyncFileStorage =
     Arc<Mutex<HashMap<String, (PathBuf, Arc<memmap2::Mmap>, HashSet<String>)>>>;
 type FileWatcherRef = Arc<Mutex<Option<FileWatcher>>>;
+type ChecksumMap = Arc<std::sync::Mutex<HashMap<PathBuf, String>>>;
 
 #[derive(Clone)]
 pub struct SshServer {
@@ -31,6 +33,7 @@ pub struct SshServer {
     rsync_file_storage: RsyncFileStorage,
     file_watcher: FileWatcherRef,
     start_time: Arc<Instant>,
+    last_checksums: ChecksumMap,
 }
 
 impl SshServer {
@@ -46,6 +49,7 @@ impl SshServer {
             rsync_file_storage: Arc::new(Mutex::new(HashMap::new())),
             file_watcher: Arc::new(Mutex::new(None)),
             start_time: Arc::new(Instant::now()),
+            last_checksums: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -98,6 +102,136 @@ impl SshServer {
     pub async fn run(port: u16) -> Result<()> {
         let mut server = Self::new().await?;
 
+        // Try to auto-load config file from current directory or ancestors
+        match Config::find_and_load() {
+            Ok((config_path, config)) => {
+                log::info!("📄 Found config: {}", config_path.display());
+                log::info!("🚀 Project: {}", config.project.name);
+
+                // Get project root (directory containing the config file)
+                let project_root = config_path
+                    .parent()
+                    .context("Config file has no parent directory")?
+                    .to_path_buf();
+
+                log::info!("📁 Project root: {}", project_root.display());
+
+                // Set up watches for each sync rule
+                let registry = server.client_registry.clone();
+                let storage = server.rsync_file_storage.clone();
+                let runtime_handle = tokio::runtime::Handle::current();
+
+                // Track last known checksum per file to prevent sync loops
+                // Only sync if file content actually changed
+                let last_checksums = server.last_checksums.clone();
+
+                // Create callback for file changes
+                let callback = {
+                    let last_checksums = last_checksums.clone();
+                    move |_watch_root: PathBuf, relative: PathBuf, absolute: PathBuf| {
+                        let registry = registry.clone();
+                        let storage = storage.clone();
+                        let relative_str = relative.to_string_lossy().to_string();
+                        let last_checksums = last_checksums.clone();
+
+                        runtime_handle.spawn(async move {
+                            // Compute current checksum
+                            let current_checksum = match tokio::fs::read(&absolute).await {
+                                Ok(data) => rsync_utils::compute_checksum(&data),
+                                Err(e) => {
+                                    log::warn!("Failed to read {} for checksum: {:#}", absolute.display(), e);
+                                    return;
+                                }
+                            };
+
+                            // Check if file actually changed
+                            let should_sync = {
+                                let mut checksums = last_checksums.lock().unwrap();
+                                if let Some(last_checksum) = checksums.get(&absolute) {
+                                    if last_checksum == &current_checksum {
+                                        log::debug!("⏭️  Skipping {} (checksum unchanged: {})", absolute.display(), &current_checksum[..8]);
+                                        false
+                                    } else {
+                                        log::info!("📝 File changed: {} (checksum: {} → {})", absolute.display(), &last_checksum[..8], &current_checksum[..8]);
+                                        checksums.insert(absolute.clone(), current_checksum.clone());
+                                        true
+                                    }
+                                } else {
+                                    log::info!("📝 New file detected: {} (checksum: {})", absolute.display(), &current_checksum[..8]);
+                                    checksums.insert(absolute.clone(), current_checksum.clone());
+                                    true
+                                }
+                            };
+
+                            if !should_sync {
+                                return;
+                            }
+
+                            log::info!("🔄 Syncing {} to clients", absolute.display());
+                            if let Err(e) = Self::sync_file_to_clients(
+                                &absolute.to_string_lossy(),
+                                &relative_str,
+                                registry,
+                                storage,
+                            ).await {
+                                log::error!("Failed to sync changed file: {:#}", e);
+                            }
+                        });
+                    }
+                };
+
+                let mut watcher = FileWatcher::new(callback)
+                    .context("Failed to create file watcher")?;
+
+                log::info!("👁️  Setting up {} watch rules", config.sync_rules.len());
+
+                // Consolidate all sync rules into a single watch with merged patterns
+                let mut all_includes: Vec<String> = Vec::new();
+                let mut all_excludes: Vec<String> = Vec::new();
+
+                for (idx, rule) in config.sync_rules.iter().enumerate() {
+                    let default_name = format!("rule-{}", idx + 1);
+                    let rule_name = rule.name.as_deref().unwrap_or(&default_name);
+
+                    log::info!(
+                        "  📋 [{}] include: {:?}, exclude: {:?}",
+                        rule_name,
+                        rule.include,
+                        rule.exclude
+                    );
+
+                    all_includes.extend(rule.include.clone());
+                    all_excludes.extend(rule.exclude.clone());
+                }
+
+                // Add consolidated watch
+                log::info!("  ⚙️  Watching {} with {} include patterns, {} exclude patterns",
+                    project_root.display(),
+                    all_includes.len(),
+                    all_excludes.len()
+                );
+
+                if let Err(e) = watcher.add_watch(
+                    project_root.clone(),
+                    true, // Always recursive for directory watches
+                    all_includes,
+                    all_excludes,
+                ) {
+                    log::error!("  ❌ Failed to add consolidated watch: {:#}", e);
+                } else {
+                    log::info!("  ✅ Consolidated watch configured");
+                }
+
+                *server.file_watcher.lock().await = Some(watcher);
+                log::info!("✨ Auto-configured watches from {}", config_path.display());
+            }
+            Err(e) => {
+                log::info!("ℹ️  No config file found ({})", e);
+                log::info!("ℹ️  Server starting without auto-configured watches");
+                log::info!("ℹ️  Use 'halfremembered-launcher watch' or 'config-sync' to configure watches");
+            }
+        }
+
         let host_key = russh::keys::PrivateKey::random(&mut OsRng, russh::keys::Algorithm::Ed25519)
             .context("Failed to generate ephemeral host key")?;
 
@@ -126,6 +260,7 @@ impl SshServer {
         rsync_storage: RsyncFileStorage,
         file_watcher: FileWatcherRef,
         start_time: Arc<Instant>,
+        last_checksums: ChecksumMap,
     ) -> LocalResponse {
         match command {
             LocalCommand::Ping { target } => {
@@ -294,30 +429,83 @@ impl SshServer {
                 if watcher_lock.is_none() {
                     let registry_clone = registry.clone();
                     let storage_clone = rsync_storage.clone();
+                    let last_checksums_clone = last_checksums.clone();
 
                     // Get a handle to the current tokio runtime
                     let runtime_handle = tokio::runtime::Handle::current();
 
                     // Create callback that syncs files when they change
-                    let callback = move |_watch_root: PathBuf, relative: PathBuf, absolute: PathBuf| {
-                        let registry = registry_clone.clone();
-                        let storage = storage_clone.clone();
-                        let relative_str = relative.to_string_lossy().to_string();
+                    let callback =
+                        move |_watch_root: PathBuf, relative: PathBuf, absolute: PathBuf| {
+                            let registry = registry_clone.clone();
+                            let storage = storage_clone.clone();
+                            let relative_str = relative.to_string_lossy().to_string();
+                            let last_checksums = last_checksums_clone.clone();
 
-                        log::info!("File changed: {} -> syncing to clients", absolute.display());
+                            // Spawn on the tokio runtime from the std::thread callback
+                            runtime_handle.spawn(async move {
+                                // Compute current checksum
+                                let current_checksum = match tokio::fs::read(&absolute).await {
+                                    Ok(data) => rsync_utils::compute_checksum(&data),
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Failed to read {} for checksum: {:#}",
+                                            absolute.display(),
+                                            e
+                                        );
+                                        return;
+                                    }
+                                };
 
-                        // Spawn on the tokio runtime from the std::thread callback
-                        runtime_handle.spawn(async move {
-                            if let Err(e) = Self::sync_file_to_clients(
-                                &absolute.to_string_lossy(),
-                                &relative_str,
-                                registry,
-                                storage,
-                            ).await {
-                                log::error!("Failed to sync changed file: {:#}", e);
-                            }
-                        });
-                    };
+                                // Check if file actually changed
+                                let should_sync = {
+                                    let mut checksums = last_checksums.lock().unwrap();
+                                    if let Some(last_checksum) = checksums.get(&absolute) {
+                                        if last_checksum == &current_checksum {
+                                            log::debug!(
+                                                "⏭️  Skipping {} (checksum unchanged: {})",
+                                                absolute.display(),
+                                                &current_checksum[..8]
+                                            );
+                                            false
+                                        } else {
+                                            log::info!(
+                                                "📝 File changed: {} (checksum: {} → {})",
+                                                absolute.display(),
+                                                &last_checksum[..8],
+                                                &current_checksum[..8]
+                                            );
+                                            checksums.insert(absolute.clone(), current_checksum.clone());
+                                            true
+                                        }
+                                    } else {
+                                        log::info!(
+                                            "📝 New file detected: {} (checksum: {})",
+                                            absolute.display(),
+                                            &current_checksum[..8]
+                                        );
+                                        checksums.insert(absolute.clone(), current_checksum.clone());
+                                        true
+                                    }
+                                };
+
+                                if !should_sync {
+                                    return;
+                                }
+
+                                log::info!("🔄 Syncing {} to clients", absolute.display());
+                                if let Err(e) = Self::sync_file_to_clients(
+                                    &absolute.to_string_lossy(),
+                                    &relative_str,
+                                    registry,
+                                    storage,
+                                )
+                                .await
+                                {
+                                    log::error!("Failed to sync changed file: {:#}", e);
+                                }
+                            });
+                        };
 
                     match FileWatcher::new(callback) {
                         Ok(watcher) => {
@@ -332,21 +520,74 @@ impl SshServer {
                     }
                 }
 
-                // Add the watch
-                let result = watcher_lock
-                    .as_mut()
-                    .unwrap()
-                    .add_watch(
-                        PathBuf::from(&path),
-                        recursive,
-                        include_patterns,
-                        exclude_patterns,
-                    );
+                let path_buf = PathBuf::from(&path);
+                let result = watcher_lock.as_mut().unwrap().add_watch(
+                    path_buf.clone(),
+                    recursive,
+                    include_patterns,
+                    exclude_patterns,
+                );
 
                 match result {
-                    Ok(_) => LocalResponse::Success {
-                        message: format!("Watching {}", path),
-                    },
+                    Ok(_) => {
+                        // After adding a watch, trigger a sync for the new files to all clients
+                        // This is crucial for interactive watch commands after clients are connected
+                        if let Ok(canonical_path) = path_buf.canonicalize() {
+                            let files_to_sync = watcher_lock
+                                .as_ref()
+                                .unwrap()
+                                .get_files_for_path(&canonical_path);
+
+                            if !files_to_sync.is_empty() {
+                                let clients = registry.lock().await.list_clients();
+                                if !clients.is_empty() {
+                                    log::info!(
+                                        "Syncing {} newly watched files to {} clients",
+                                        files_to_sync.len(),
+                                        clients.len()
+                                    );
+
+                                    for client in &clients {
+                                        for (_watch_root, relative_path, absolute_path) in
+                                            &files_to_sync
+                                        {
+                                            let registry_clone = registry.clone();
+                                            let storage_clone = rsync_storage.clone();
+                                            let client_clone = client.clone();
+                                            let abs_path_str =
+                                                absolute_path.to_string_lossy().to_string();
+                                            let rel_path_str =
+                                                relative_path.to_string_lossy().to_string();
+
+                                            tokio::spawn(async move {
+                                                if let Err(e) = SshServer::sync_file_to_client(
+                                                    &abs_path_str,
+                                                    &rel_path_str,
+                                                    &client_clone.hostname,
+                                                    &client_clone.session_id,
+                                                    registry_clone,
+                                                    storage_clone,
+                                                )
+                                                .await
+                                                {
+                                                    log::error!(
+                                                        "Failed to sync {} to {}: {:#}",
+                                                        abs_path_str,
+                                                        client_clone.hostname,
+                                                        e
+                                                    );
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        LocalResponse::Success {
+                            message: format!("Watching {}", path),
+                        }
+                    }
                     Err(e) => LocalResponse::Error {
                         message: format!("Failed to add watch: {:#}", e),
                     },
@@ -472,6 +713,80 @@ impl SshServer {
         Ok(client_count)
     }
 
+    /// Sync a file to a specific client by hostname
+    async fn sync_file_to_client(
+        file_path: &str,
+        destination: &str,
+        hostname: &str,
+        session_id: &str,
+        registry: Arc<Mutex<ClientRegistry>>,
+        rsync_storage: RsyncFileStorage,
+    ) -> Result<()> {
+        let path = Path::new(file_path);
+
+        if !path.exists() {
+            anyhow::bail!("File not found: {}", file_path);
+        }
+
+        // Open file, mmap it, and immediately close the file handle
+        let file_data = {
+            let file = std::fs::File::open(&path).context("Failed to open file")?;
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            Arc::new(mmap)
+        };
+
+        // Read file and compute metadata
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .context("Failed to read file metadata")?;
+
+        let size = metadata.len();
+        let mtime = metadata
+            .modified()
+            .context("Failed to get file mtime")?
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("Invalid mtime")?
+            .as_secs();
+
+        // Compute checksum
+        let checksum = rsync_utils::compute_checksum(&file_data);
+
+        // Choose block size
+        let block_size = rsync_utils::choose_block_size(size);
+
+        log::debug!(
+            "Syncing {} ({} bytes) to client {} via rsync",
+            file_path,
+            size,
+            hostname
+        );
+
+        // Send to specific client
+        let request_id = format!("rsync-{}", uuid::Uuid::new_v4());
+        let rsync_msg = ServerMessage::RsyncStart {
+            request_id: request_id.clone(),
+            relative_path: destination.to_string(),
+            size,
+            checksum,
+            mtime,
+            block_size,
+        };
+
+        // Store file data for rsync operations with just this client
+        let mut client_ids = HashSet::new();
+        client_ids.insert(session_id.to_string());
+
+        rsync_storage.lock().await.insert(
+            request_id.clone(),
+            (path.to_path_buf(), file_data, client_ids),
+        );
+
+        registry.lock().await.send_to_client(hostname, &rsync_msg).await?;
+
+        log::trace!("Sent rsync start for {} to {}", file_path, hostname);
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn get_registry(&self) -> Arc<Mutex<ClientRegistry>> {
         self.client_registry.clone()
@@ -501,6 +816,7 @@ impl russh::server::Server for SshServer {
             rsync_file_storage: self.rsync_file_storage.clone(),
             file_watcher: self.file_watcher.clone(),
             start_time: self.start_time.clone(),
+            last_checksums: self.last_checksums.clone(),
         }
     }
 }
@@ -541,6 +857,7 @@ pub struct SshSession {
     rsync_file_storage: RsyncFileStorage,
     file_watcher: FileWatcherRef,
     start_time: Arc<Instant>,
+    last_checksums: ChecksumMap,
 }
 
 impl russh::server::Handler for SshSession {
@@ -682,8 +999,8 @@ impl SshSession {
         log::debug!("Received {}", msg.message_type());
 
         match msg {
-            ClientMessage::Register { hostname, platform } => {
-                log::info!("Client registered: {} ({})", hostname, platform);
+            ClientMessage::Register { hostname, platform, initial_sync } => {
+                log::info!("Client registered: {} ({}, initial_sync: {})", hostname, platform, initial_sync);
 
                 self.hostname = Some(hostname.clone());
 
@@ -717,6 +1034,61 @@ impl SshSession {
 
                 log::info!("Sending test ping to {}", hostname);
                 self.send_message(&ping, channel, session).await?;
+
+                // Perform initial sync of all watched files (if requested)
+                if initial_sync {
+                    let watcher_lock = self.file_watcher.lock().await;
+                    if let Some(watcher) = watcher_lock.as_ref() {
+                    let watched_files = watcher.get_all_watched_files();
+                    drop(watcher_lock); // Release lock before async operations
+
+                    if !watched_files.is_empty() {
+                        let file_count = watched_files.len();
+                        log::info!(
+                            "Starting initial sync of {} files to {}",
+                            file_count,
+                            hostname
+                        );
+
+                        for (_watch_root, relative_path, absolute_path) in watched_files {
+                            let file_path_str = absolute_path.to_string_lossy().to_string();
+                            let dest_str = relative_path.to_string_lossy().to_string();
+
+                            let registry_clone = self.client_registry.clone();
+                            let storage_clone = self.rsync_file_storage.clone();
+                            let hostname_clone = hostname.clone();
+                            let session_id_clone = self.session_id.clone();
+
+                            // Spawn sync task to avoid blocking registration
+                            tokio::spawn(async move {
+                                if let Err(e) = SshServer::sync_file_to_client(
+                                    &file_path_str,
+                                    &dest_str,
+                                    &hostname_clone,
+                                    &session_id_clone,
+                                    registry_clone,
+                                    storage_clone,
+                                )
+                                .await
+                                {
+                                    log::error!(
+                                        "Failed to sync {} to {}: {:#}",
+                                        file_path_str,
+                                        hostname_clone,
+                                        e
+                                    );
+                                }
+                            });
+                        }
+
+                        log::info!("Queued initial sync of {} files to {}", file_count, hostname);
+                    } else {
+                        log::debug!("No watched files to sync to {}", hostname);
+                    }
+                    }
+                } else {
+                    log::info!("Skipping initial sync for {} (disabled by client)", hostname);
+                }
             }
 
             ClientMessage::Heartbeat {
@@ -830,6 +1202,7 @@ impl SshSession {
             self.rsync_file_storage.clone(),
             self.file_watcher.clone(),
             self.start_time.clone(),
+            self.last_checksums.clone(),
         )
         .await;
 
