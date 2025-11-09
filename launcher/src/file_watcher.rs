@@ -1,17 +1,17 @@
 // Filesystem watching with automatic file syncing
 //
-// Uses notify-debouncer-mini for cross-platform filesystem events with debouncing.
+// Uses custom debouncer with time-based and checksum-based deduplication.
 // Integrates with the rsync-based file syncing system.
 
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use halfremembered_protocol::WatchInfo;
-use notify::RecursiveMode;
-use notify_debouncer_mini::{new_debouncer, Debouncer, DebouncedEventKind};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Configuration for a single watch
 #[derive(Debug, Clone)]
@@ -93,22 +93,37 @@ impl WatchConfig {
     }
 }
 
+/// State tracking for each watched file
+#[derive(Debug, Clone)]
+struct FileState {
+    /// Last time an event was processed for this file
+    last_event_time: Instant,
+    /// Last known checksum of the file content
+    last_checksum: String,
+}
+
+/// Compute SHA-256 checksum of file data (synchronous version for std::thread context)
+fn compute_checksum_sync(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+
 /// Filesystem watcher that triggers automatic file syncing
 pub struct FileWatcher {
     /// Active watch configurations indexed by canonical path
     watches: Arc<Mutex<HashMap<PathBuf, WatchConfig>>>,
-    /// The underlying debounced watcher (type-erased)
-    _debouncer: Debouncer<notify::RecommendedWatcher>,
-    /// Channel for receiving debounced events (dummy - real receiver is in thread)
-    #[allow(dead_code)]
-    event_receiver: mpsc::Receiver<Vec<PathBuf>>,
+    /// Per-file state for debouncing and checksum tracking
+    file_states: Arc<Mutex<HashMap<PathBuf, FileState>>>,
+    /// The underlying notify watcher
+    _watcher: RecommendedWatcher,
 }
 
 impl FileWatcher {
     /// Create a new file watcher with a callback for file changes
     ///
     /// The callback receives (watch_root, relative_path, absolute_path) for each
-    /// file that changes and passes filters.
+    /// file that changes and passes filters (time-based debouncing + checksum verification).
     pub fn new<F>(mut on_change: F) -> Result<Self>
     where
         F: FnMut(PathBuf, PathBuf, PathBuf) + Send + 'static,
@@ -116,55 +131,80 @@ impl FileWatcher {
         let watches: Arc<Mutex<HashMap<PathBuf, WatchConfig>>> = Arc::new(Mutex::new(HashMap::new()));
         let watches_clone = Arc::clone(&watches);
 
-        // Create channel for debouncer events
-        let (debounce_tx, debounce_rx) = mpsc::channel();
+        let file_states: Arc<Mutex<HashMap<PathBuf, FileState>>> = Arc::new(Mutex::new(HashMap::new()));
+        let file_states_clone = Arc::clone(&file_states);
 
-        // Create debouncer with 100ms delay
-        let debouncer = new_debouncer(
-            Duration::from_millis(100),
-            debounce_tx,
-        )
-        .context("Failed to create filesystem watcher")?;
-
-        // Spawn thread to process events
-        std::thread::spawn(move || {
-            while let Ok(result) = debounce_rx.recv() {
+        // Create raw notify watcher with custom event handler
+        let watcher = RecommendedWatcher::new(
+            move |result: Result<Event, notify::Error>| {
                 match result {
-                    Ok(events) => {
-                        let watches = watches_clone.lock().unwrap();
+                    Ok(event) => {
+                        // Filter 1: Only process data modification events
+                        if !matches!(event.kind, EventKind::Modify(ModifyKind::Data(_))) {
+                            log::trace!("Ignoring non-data event: {:?}", event.kind);
+                            return;
+                        }
 
-                        // Deduplicate events by path - cargo/build tools often generate
-                        // multiple events (write, chmod, metadata) for the same file
-                        let mut seen_paths = std::collections::HashSet::new();
-
-                        for event in events {
-                            let path = event.path;
-
-                            // Only process write/modify events, ignore access/metadata changes
-                            // This prevents feedback loops from reading files during sync
-                            match event.kind {
-                                DebouncedEventKind::Any => {
-                                    // Any means modify/write in debounced context
-                                    log::trace!("Processing write event for: {}", path.display());
-                                }
-                                _ => {
-                                    log::trace!("Ignoring non-write event for: {}", path.display());
-                                    continue;
-                                }
-                            }
-
+                        for path in event.paths {
                             // Only process regular files
                             if !path.is_file() {
                                 continue;
                             }
 
-                            // Skip if we've already processed this path in this batch
-                            if !seen_paths.insert(path.clone()) {
-                                log::trace!("Skipping duplicate event for: {}", path.display());
+                            // Filter 2: Time-based debounce (100ms window)
+                            let should_process = {
+                                let states = file_states_clone.lock().unwrap();
+                                if let Some(state) = states.get(&path) {
+                                    if state.last_event_time.elapsed() < Duration::from_millis(100) {
+                                        log::trace!("⏱️  Debouncing {}", path.display());
+                                        return;
+                                    }
+                                }
+                                true
+                            };
+
+                            if !should_process {
                                 continue;
                             }
 
-                            // Find which watch(es) this path belongs to
+                            // Filter 3: Checksum-based deduplication
+                            let current_checksum = match std::fs::read(&path) {
+                                Ok(data) => compute_checksum_sync(&data),
+                                Err(e) => {
+                                    log::warn!("Failed to read {} for checksum: {:#}", path.display(), e);
+                                    continue;
+                                }
+                            };
+
+                            let should_callback = {
+                                let mut states = file_states_clone.lock().unwrap();
+                                if let Some(state) = states.get_mut(&path) {
+                                    if state.last_checksum == current_checksum {
+                                        log::debug!("⏭️  Skipping {} (checksum unchanged: {})", path.display(), &current_checksum[..8]);
+                                        state.last_event_time = Instant::now();
+                                        false
+                                    } else {
+                                        log::info!("📝 File changed: {} (checksum: {} → {})", path.display(), &state.last_checksum[..8], &current_checksum[..8]);
+                                        state.last_event_time = Instant::now();
+                                        state.last_checksum = current_checksum;
+                                        true
+                                    }
+                                } else {
+                                    log::info!("📝 New file: {} (checksum: {})", path.display(), &current_checksum[..8]);
+                                    states.insert(path.clone(), FileState {
+                                        last_event_time: Instant::now(),
+                                        last_checksum: current_checksum,
+                                    });
+                                    true
+                                }
+                            };
+
+                            if !should_callback {
+                                continue;
+                            }
+
+                            // All filters passed - find matching watches and invoke callback
+                            let watches = watches_clone.lock().unwrap();
                             for (watch_root, config) in watches.iter() {
                                 if config.matches(&path) {
                                     // Compute relative path using config.path (not watch_root key)
@@ -174,30 +214,25 @@ impl FileWatcher {
                                         Err(_) => continue,
                                     };
 
-                                    log::info!(
-                                        "File changed: {} (watch: {}, relative: {})",
-                                        path.display(),
-                                        watch_root.display(),
-                                        relative.display()
-                                    );
-
                                     // Call the sync callback
                                     on_change(watch_root.clone(), relative, path.clone());
                                 }
                             }
                         }
                     }
-                    Err(errors) => {
-                        log::error!("Filesystem watch error: {:?}", errors);
+                    Err(e) => {
+                        log::error!("Filesystem watch error: {:?}", e);
                     }
                 }
-            }
-        });
+            },
+            notify::Config::default(),
+        )
+        .context("Failed to create filesystem watcher")?;
 
         Ok(Self {
             watches,
-            _debouncer: debouncer,
-            event_receiver: mpsc::channel().1, // Dummy receiver, real one is in thread
+            file_states,
+            _watcher: watcher,
         })
     }
 
@@ -247,8 +282,7 @@ impl FileWatcher {
             )?;
 
             // Watch the parent directory non-recursively
-            self._debouncer
-                .watcher()
+            self._watcher
                 .watch(&parent, RecursiveMode::NonRecursive)
                 .context(format!("Failed to watch parent directory: {}", parent.display()))?;
 
@@ -280,8 +314,7 @@ impl FileWatcher {
                 RecursiveMode::NonRecursive
             };
 
-            self._debouncer
-                .watcher()
+            self._watcher
                 .watch(&canonical, mode)
                 .context(format!("Failed to watch directory: {}", canonical.display()))?;
 
@@ -339,8 +372,7 @@ impl FileWatcher {
                 );
             } else {
                 log::debug!("Unwatching {}", watched_path.display());
-                self._debouncer
-                    .watcher()
+                self._watcher
                     .unwatch(watched_path)
                     .context(format!("Failed to unwatch path: {}", watched_path.display()))?;
             }

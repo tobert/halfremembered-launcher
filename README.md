@@ -4,6 +4,57 @@ A secure, persistent SSH-based RPC system for syncing build artifacts and launch
 by OpenSSH's ControlMaster architecture, it provides server-initiated push capabilities to clients behind NAT/dynamic
 IPs while maintaining SSH security.
 
+## 🚀 Self-Deployment Setup
+
+The launcher can build and sync itself to client machines.
+
+**Prerequisites**: SSH agent with keys loaded (`ssh-add -l`), Rust toolchain, and for Windows builds: `mingw-w64-gcc` and `x86_64-pc-windows-gnu` target.
+
+### 1. Build on Your Development Machine
+
+```bash
+# Build for Linux
+cargo build --release
+
+# Optional: Build for Windows (requires cross-compile toolchain)
+rustup target add x86_64-pc-windows-gnu
+# Arch: sudo pacman -S mingw-w64-gcc nasm
+# Ubuntu: sudo apt install gcc-mingw-w64-x86-64 nasm
+./build-windows.sh
+```
+
+### 2. Start Server and Connect Clients
+
+```bash
+# Terminal 1: Start server on build machine
+# The server auto-detects .hrlauncher.toml and configures watches
+./target/release/halfremembered-launcher server
+
+# Get the scp command to run on your client
+echo "scp $USER@$(hostname):$(pwd)/target/release/halfremembered-launcher ~/bin/"
+
+# Terminal 2: On your laptop/client machine, run that scp command, then:
+~/bin/halfremembered-launcher client buildmachine
+```
+
+The included `.hrlauncher.toml` is **automatically loaded** when you start the server. The server walks up from the current directory (like git does) to find the config file and configures watches for all sync rules.
+
+> 💡 **New in this version**: No need to run `config-sync` separately! The server auto-configures on startup.
+
+### 3. Build and Auto-Deploy
+
+With the server running and clients connected, any new builds sync automatically to connected clients:
+
+```bash
+# Linux build → syncs to all clients
+cargo build --release
+
+# Windows build → syncs to all clients
+./build-windows.sh
+```
+
+Edit `.hrlauncher.toml` to customize sync paths and targets.
+
 ## Quick Start
 
 Get up and running in four steps. This guide assumes your SSH agent is running and has keys loaded (`ssh-add -l`).

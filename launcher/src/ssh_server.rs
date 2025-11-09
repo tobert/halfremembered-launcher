@@ -24,7 +24,6 @@ use crate::rsync_utils;
 type RsyncFileStorage =
     Arc<Mutex<HashMap<String, (PathBuf, Arc<memmap2::Mmap>, HashSet<String>)>>>;
 type FileWatcherRef = Arc<Mutex<Option<FileWatcher>>>;
-type ChecksumMap = Arc<std::sync::Mutex<HashMap<PathBuf, String>>>;
 
 #[derive(Clone)]
 pub struct SshServer {
@@ -33,7 +32,6 @@ pub struct SshServer {
     rsync_file_storage: RsyncFileStorage,
     file_watcher: FileWatcherRef,
     start_time: Arc<Instant>,
-    last_checksums: ChecksumMap,
 }
 
 impl SshServer {
@@ -49,7 +47,6 @@ impl SshServer {
             rsync_file_storage: Arc::new(Mutex::new(HashMap::new())),
             file_watcher: Arc::new(Mutex::new(None)),
             start_time: Arc::new(Instant::now()),
-            last_checksums: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -121,63 +118,25 @@ impl SshServer {
                 let storage = server.rsync_file_storage.clone();
                 let runtime_handle = tokio::runtime::Handle::current();
 
-                // Track last known checksum per file to prevent sync loops
-                // Only sync if file content actually changed
-                let last_checksums = server.last_checksums.clone();
-
                 // Create callback for file changes
-                let callback = {
-                    let last_checksums = last_checksums.clone();
-                    move |_watch_root: PathBuf, relative: PathBuf, absolute: PathBuf| {
-                        let registry = registry.clone();
-                        let storage = storage.clone();
-                        let relative_str = relative.to_string_lossy().to_string();
-                        let last_checksums = last_checksums.clone();
+                // FileWatcher already verified the file actually changed (checksum-based)
+                let callback = move |_watch_root: PathBuf, relative: PathBuf, absolute: PathBuf| {
+                    let registry = registry.clone();
+                    let storage = storage.clone();
+                    let relative_str = relative.to_string_lossy().to_string();
 
-                        runtime_handle.spawn(async move {
-                            // Compute current checksum
-                            let current_checksum = match tokio::fs::read(&absolute).await {
-                                Ok(data) => rsync_utils::compute_checksum(&data),
-                                Err(e) => {
-                                    log::warn!("Failed to read {} for checksum: {:#}", absolute.display(), e);
-                                    return;
-                                }
-                            };
+                    log::info!("🔄 Syncing {} to clients", absolute.display());
 
-                            // Check if file actually changed
-                            let should_sync = {
-                                let mut checksums = last_checksums.lock().unwrap();
-                                if let Some(last_checksum) = checksums.get(&absolute) {
-                                    if last_checksum == &current_checksum {
-                                        log::debug!("⏭️  Skipping {} (checksum unchanged: {})", absolute.display(), &current_checksum[..8]);
-                                        false
-                                    } else {
-                                        log::info!("📝 File changed: {} (checksum: {} → {})", absolute.display(), &last_checksum[..8], &current_checksum[..8]);
-                                        checksums.insert(absolute.clone(), current_checksum.clone());
-                                        true
-                                    }
-                                } else {
-                                    log::info!("📝 New file detected: {} (checksum: {})", absolute.display(), &current_checksum[..8]);
-                                    checksums.insert(absolute.clone(), current_checksum.clone());
-                                    true
-                                }
-                            };
-
-                            if !should_sync {
-                                return;
-                            }
-
-                            log::info!("🔄 Syncing {} to clients", absolute.display());
-                            if let Err(e) = Self::sync_file_to_clients(
-                                &absolute.to_string_lossy(),
-                                &relative_str,
-                                registry,
-                                storage,
-                            ).await {
-                                log::error!("Failed to sync changed file: {:#}", e);
-                            }
-                        });
-                    }
+                    runtime_handle.spawn(async move {
+                        if let Err(e) = Self::sync_file_to_clients(
+                            &absolute.to_string_lossy(),
+                            &relative_str,
+                            registry,
+                            storage,
+                        ).await {
+                            log::error!("Failed to sync changed file: {:#}", e);
+                        }
+                    });
                 };
 
                 let mut watcher = FileWatcher::new(callback)
@@ -260,7 +219,6 @@ impl SshServer {
         rsync_storage: RsyncFileStorage,
         file_watcher: FileWatcherRef,
         start_time: Arc<Instant>,
-        last_checksums: ChecksumMap,
     ) -> LocalResponse {
         match command {
             LocalCommand::Ping { target } => {
@@ -429,71 +387,22 @@ impl SshServer {
                 if watcher_lock.is_none() {
                     let registry_clone = registry.clone();
                     let storage_clone = rsync_storage.clone();
-                    let last_checksums_clone = last_checksums.clone();
 
                     // Get a handle to the current tokio runtime
                     let runtime_handle = tokio::runtime::Handle::current();
 
                     // Create callback that syncs files when they change
+                    // FileWatcher already verified the file actually changed (checksum-based)
                     let callback =
                         move |_watch_root: PathBuf, relative: PathBuf, absolute: PathBuf| {
                             let registry = registry_clone.clone();
                             let storage = storage_clone.clone();
                             let relative_str = relative.to_string_lossy().to_string();
-                            let last_checksums = last_checksums_clone.clone();
+
+                            log::info!("🔄 Syncing {} to clients", absolute.display());
 
                             // Spawn on the tokio runtime from the std::thread callback
                             runtime_handle.spawn(async move {
-                                // Compute current checksum
-                                let current_checksum = match tokio::fs::read(&absolute).await {
-                                    Ok(data) => rsync_utils::compute_checksum(&data),
-                                    Err(e) => {
-                                        log::warn!(
-                                            "Failed to read {} for checksum: {:#}",
-                                            absolute.display(),
-                                            e
-                                        );
-                                        return;
-                                    }
-                                };
-
-                                // Check if file actually changed
-                                let should_sync = {
-                                    let mut checksums = last_checksums.lock().unwrap();
-                                    if let Some(last_checksum) = checksums.get(&absolute) {
-                                        if last_checksum == &current_checksum {
-                                            log::debug!(
-                                                "⏭️  Skipping {} (checksum unchanged: {})",
-                                                absolute.display(),
-                                                &current_checksum[..8]
-                                            );
-                                            false
-                                        } else {
-                                            log::info!(
-                                                "📝 File changed: {} (checksum: {} → {})",
-                                                absolute.display(),
-                                                &last_checksum[..8],
-                                                &current_checksum[..8]
-                                            );
-                                            checksums.insert(absolute.clone(), current_checksum.clone());
-                                            true
-                                        }
-                                    } else {
-                                        log::info!(
-                                            "📝 New file detected: {} (checksum: {})",
-                                            absolute.display(),
-                                            &current_checksum[..8]
-                                        );
-                                        checksums.insert(absolute.clone(), current_checksum.clone());
-                                        true
-                                    }
-                                };
-
-                                if !should_sync {
-                                    return;
-                                }
-
-                                log::info!("🔄 Syncing {} to clients", absolute.display());
                                 if let Err(e) = Self::sync_file_to_clients(
                                     &absolute.to_string_lossy(),
                                     &relative_str,
@@ -816,7 +725,6 @@ impl russh::server::Server for SshServer {
             rsync_file_storage: self.rsync_file_storage.clone(),
             file_watcher: self.file_watcher.clone(),
             start_time: self.start_time.clone(),
-            last_checksums: self.last_checksums.clone(),
         }
     }
 }
@@ -857,7 +765,6 @@ pub struct SshSession {
     rsync_file_storage: RsyncFileStorage,
     file_watcher: FileWatcherRef,
     start_time: Arc<Instant>,
-    last_checksums: ChecksumMap,
 }
 
 impl russh::server::Handler for SshSession {
@@ -1202,7 +1109,6 @@ impl SshSession {
             self.rsync_file_storage.clone(),
             self.file_watcher.clone(),
             self.start_time.clone(),
-            self.last_checksums.clone(),
         )
         .await;
 

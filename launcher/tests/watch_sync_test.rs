@@ -270,6 +270,16 @@ async fn setup_watch(
 async fn test_watch_sync_integration() -> Result<()> {
     let fixture = setup_test().await?;
 
+    // Explicitly set up watch for the test directory
+    // (Don't rely on auto-config which finds the project's .hrlauncher.toml)
+    setup_watch(
+        &fixture,
+        vec!["**/*".to_string()],  // Include all files
+        vec!["*.rs".to_string()],  // Exclude .rs files (for later test)
+    ).await?;
+
+    log::info!("Watch configured for test directory");
+
     // Create a test file in the watched directory
     let test_file_path = fixture.server_watch_dir.path().join("test.txt");
     let test_content = "Hello from watch sync test!";
