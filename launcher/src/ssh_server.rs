@@ -25,11 +25,15 @@ type RsyncFileStorage =
     Arc<Mutex<HashMap<String, (PathBuf, Arc<memmap2::Mmap>, HashSet<String>)>>>;
 type FileWatcherRef = Arc<Mutex<Option<FileWatcher>>>;
 
+// Shared storage for execute metadata: maps request_id to (relative_path, execute_config)
+type ExecuteMetadataStorage = Arc<Mutex<HashMap<String, (String, crate::config::ExecuteConfig)>>>;
+
 #[derive(Clone)]
 pub struct SshServer {
     client_registry: Arc<Mutex<ClientRegistry>>,
     authorized_keys: Arc<Vec<ssh_key::PublicKey>>,
     rsync_file_storage: RsyncFileStorage,
+    execute_metadata: ExecuteMetadataStorage,
     file_watcher: FileWatcherRef,
     start_time: Arc<Instant>,
     rsync_semaphore: Arc<tokio::sync::Semaphore>,
@@ -46,6 +50,7 @@ impl SshServer {
             client_registry: Arc::new(Mutex::new(ClientRegistry::new())),
             authorized_keys: Arc::new(authorized_keys),
             rsync_file_storage: Arc::new(Mutex::new(HashMap::new())),
+            execute_metadata: Arc::new(Mutex::new(HashMap::new())),
             file_watcher: Arc::new(Mutex::new(None)),
             start_time: Arc::new(Instant::now()),
             rsync_semaphore: Arc::new(tokio::sync::Semaphore::new(5)), // Limit to 5 concurrent rsyncs
@@ -300,13 +305,30 @@ impl SshServer {
             } => {
                 log::info!("Execute request: {} on {}", binary, target);
 
+                // Parse optional env vars from args (format: VAR=value)
+                // This allows CLI usage like: execute client game.exe RUST_LOG=debug --windowed
+                let mut env = std::collections::HashMap::new();
+                let mut clean_args = Vec::new();
+                for arg in args {
+                    if let Some((key, value)) = arg.split_once('=') {
+                        // Check if this looks like an env var (uppercase letters/underscore)
+                        if key.chars().all(|c| c.is_uppercase() || c.is_numeric() || c == '_')
+                            && key.chars().next().map_or(false, |c| c.is_alphabetic()) {
+                            env.insert(key.to_string(), value.to_string());
+                            log::debug!("Parsed env var: {}={}", key, value);
+                            continue;
+                        }
+                    }
+                    clean_args.push(arg);
+                }
+
                 let request_id = format!("exec-{}", uuid::Uuid::new_v4());
                 let exec_msg = ServerMessage::Execute {
                     request_id: request_id.clone(),
                     binary,
-                    args,
+                    args: clean_args,
                     working_dir: None,
-                    env: std::collections::HashMap::new(),
+                    env,
                 };
 
                 let result = registry
@@ -567,6 +589,28 @@ impl SshServer {
         registry: Arc<Mutex<ClientRegistry>>,
         rsync_storage: RsyncFileStorage,
     ) -> Result<usize> {
+        Self::sync_file_to_clients_impl(file_path, destination, registry, rsync_storage, None, None).await
+    }
+
+    async fn sync_file_to_clients_with_exec(
+        file_path: &str,
+        destination: &str,
+        registry: Arc<Mutex<ClientRegistry>>,
+        rsync_storage: RsyncFileStorage,
+        exec_metadata: ExecuteMetadataStorage,
+        exec_config: Option<crate::config::ExecuteConfig>,
+    ) -> Result<usize> {
+        Self::sync_file_to_clients_impl(file_path, destination, registry, rsync_storage, Some(exec_metadata), exec_config).await
+    }
+
+    async fn sync_file_to_clients_impl(
+        file_path: &str,
+        destination: &str,
+        registry: Arc<Mutex<ClientRegistry>>,
+        rsync_storage: RsyncFileStorage,
+        exec_metadata: Option<ExecuteMetadataStorage>,
+        exec_config: Option<crate::config::ExecuteConfig>,
+    ) -> Result<usize> {
         let path = Path::new(file_path);
 
         if !path.exists() {
@@ -636,6 +680,15 @@ impl SshServer {
             request_id.clone(),
             (path.to_path_buf(), file_data, client_ids),
         );
+
+        // Store execute metadata if provided
+        if let (Some(exec_storage), Some(config)) = (exec_metadata, exec_config) {
+            exec_storage.lock().await.insert(
+                request_id.clone(),
+                (destination.to_string(), config),
+            );
+            log::debug!("Stored execute metadata for request: {}", request_id);
+        }
 
         registry.lock().await.broadcast(&rsync_msg).await?;
 
@@ -749,6 +802,7 @@ impl russh::server::Server for SshServer {
             session_type: SessionType::Unknown,
             rsync_channels: HashMap::new(),
             rsync_file_storage: self.rsync_file_storage.clone(),
+            execute_metadata: self.execute_metadata.clone(),
             file_watcher: self.file_watcher.clone(),
             start_time: self.start_time.clone(),
             rsync_semaphore: self.rsync_semaphore.clone(),
@@ -790,6 +844,7 @@ pub struct SshSession {
     session_type: SessionType,
     rsync_channels: HashMap<ChannelId, RsyncChannelState>,
     rsync_file_storage: RsyncFileStorage,
+    execute_metadata: ExecuteMetadataStorage,
     file_watcher: FileWatcherRef,
     start_time: Arc<Instant>,
     rsync_semaphore: Arc<tokio::sync::Semaphore>,
@@ -1065,6 +1120,28 @@ impl SshSession {
                         &checksum[..8],
                         request_id
                     );
+
+                    // Check if this sync has execute config
+                    let exec_metadata = self.execute_metadata.lock().await;
+                    if let Some((relative_path, exec_config)) = exec_metadata.get(&request_id) {
+                        log::info!("Triggering execute after sync: {}", exec_config.command);
+
+                        // Create execute message
+                        let execute_id = format!("exec-{}", uuid::Uuid::new_v4());
+                        let execute_msg = ServerMessage::Execute {
+                            request_id: execute_id,
+                            binary: exec_config.command.clone(),
+                            args: exec_config.args.clone(),
+                            working_dir: exec_config.working_dir.clone(),
+                            env: exec_config.env.clone(),
+                        };
+
+                        // Send to this client
+                        if let Err(e) = self.send_message(&execute_msg, channel, session).await {
+                            log::error!("Failed to send execute message: {:#}", e);
+                        }
+                    }
+                    drop(exec_metadata);
                 } else {
                     log::error!(
                         "Rsync failed: {} (request: {}, error: {:?})",
@@ -1081,6 +1158,9 @@ impl SshSession {
                     if pending_clients.is_empty() {
                         storage.remove(&request_id);
                         log::debug!("Cleaned up rsync storage for request: {}", request_id);
+
+                        // Also clean up execute metadata
+                        self.execute_metadata.lock().await.remove(&request_id);
                     }
                 }
             }

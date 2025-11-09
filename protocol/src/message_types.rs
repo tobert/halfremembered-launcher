@@ -19,6 +19,12 @@ pub const MSG_RSYNC_COMPLETE: u16 = 0x0101; // Control channel: sync result
 pub const MSG_RSYNC_SIGNATURE: u16 = 0x0102; // Rsync channel: file signature
 pub const MSG_RSYNC_DELTA: u16 = 0x0103; // Rsync channel: delta data
 
+// Exec Messages (0x0150 - 0x015F)
+pub const MSG_EXEC_HANDSHAKE: u16 = 0x0150; // Exec channel: execute_id handshake
+pub const MSG_EXEC_STDOUT: u16 = 0x0151; // Exec channel: stdout data
+pub const MSG_EXEC_STDERR: u16 = 0x0152; // Exec channel: stderr data
+pub const MSG_EXEC_EXIT: u16 = 0x0153; // Exec channel: exit code
+
 // Stream Messages (0x0200 - 0x02FF)
 pub const MSG_STREAM_OPEN: u16 = 0x0200; // Control channel
 pub const MSG_STREAM_CLOSE: u16 = 0x0201; // Control channel
@@ -50,6 +56,11 @@ pub fn message_type_name(msg_type: u16) -> &'static str {
         MSG_RSYNC_COMPLETE => "RsyncComplete",
         MSG_RSYNC_SIGNATURE => "RsyncSignature",
         MSG_RSYNC_DELTA => "RsyncDelta",
+
+        MSG_EXEC_HANDSHAKE => "ExecHandshake",
+        MSG_EXEC_STDOUT => "ExecStdout",
+        MSG_EXEC_STDERR => "ExecStderr",
+        MSG_EXEC_EXIT => "ExecExit",
 
         MSG_STREAM_OPEN => "StreamOpen",
         MSG_STREAM_CLOSE => "StreamClose",
@@ -98,6 +109,10 @@ mod tests {
             MSG_RSYNC_COMPLETE,
             MSG_RSYNC_SIGNATURE,
             MSG_RSYNC_DELTA,
+            MSG_EXEC_HANDSHAKE,
+            MSG_EXEC_STDOUT,
+            MSG_EXEC_STDERR,
+            MSG_EXEC_EXIT,
             MSG_STREAM_OPEN,
             MSG_STREAM_CLOSE,
             MSG_STREAM_ERROR,

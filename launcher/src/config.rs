@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Root configuration structure for .hrlauncher.toml
@@ -62,6 +63,30 @@ pub struct SyncRule {
     /// Use with caution - this will remove files!
     #[serde(default)]
     pub mirror: bool,
+
+    /// Optional: Execute configuration to run after files are synced
+    #[serde(default)]
+    pub execute: Option<ExecuteConfig>,
+}
+
+/// Configuration for executing a binary after sync
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteConfig {
+    /// Command to execute (relative path or absolute path)
+    /// Can reference synced files using destination path
+    pub command: String,
+
+    /// Optional command-line arguments
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    /// Optional environment variables to set
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+
+    /// Optional working directory (defaults to destination if not specified)
+    #[serde(default)]
+    pub working_dir: Option<String>,
 }
 
 impl Config {
@@ -140,6 +165,13 @@ include = ["*.exe", "*.dll"]
 destination = "bin/"
 clients = ["windows-*"]
 
+[sync.execute]
+command = "bin/game.exe"
+args = ["--debug", "--windowed"]
+
+[sync.execute.env]
+RUST_LOG = "debug"
+
 [[sync]]
 include = ["assets/**/*"]
 exclude = ["**/*.psd"]
@@ -157,6 +189,11 @@ mirror = true
         assert_eq!(rule1.include.len(), 2);
         assert_eq!(rule1.destination, "bin/");
         assert_eq!(rule1.clients, vec!["windows-*"]);
+
+        let exec = rule1.execute.as_ref().expect("Execute config should exist");
+        assert_eq!(exec.command, "bin/game.exe");
+        assert_eq!(exec.args, vec!["--debug", "--windowed"]);
+        assert_eq!(exec.env.get("RUST_LOG"), Some(&"debug".to_string()));
 
         let rule2 = &config.sync_rules[1];
         assert_eq!(rule2.include, vec!["assets/**/*"]);
