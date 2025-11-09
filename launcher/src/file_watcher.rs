@@ -139,9 +139,10 @@ impl FileWatcher {
             move |result: Result<Event, notify::Error>| {
                 match result {
                     Ok(event) => {
-                        // Filter 1: Only process data modification events
-                        if !matches!(event.kind, EventKind::Modify(ModifyKind::Data(_))) {
-                            log::trace!("Ignoring non-data event: {:?}", event.kind);
+                        // Filter 1: Only process data modification and file creation events
+                        // Create events are needed because cargo uses hardlinks for final binaries
+                        if !matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)) | EventKind::Create(_)) {
+                            log::trace!("Ignoring non-data/create event: {:?}", event.kind);
                             return;
                         }
 
