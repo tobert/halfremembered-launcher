@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use halfremembered_protocol::{
     ClientMessage, ClientState, Frame, ServerMessage, MSG_RSYNC_DELTA, MSG_RSYNC_SIGNATURE,
 };
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,6 +10,25 @@ use tokio::time;
 
 use crate::rsync_utils;
 use crate::ssh_client::SshClientConnection;
+
+/// Expand tilde (~) in paths to the user's home directory
+fn expand_tilde(path: &str) -> PathBuf {
+    if path.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home).join(&path[2..])
+        } else {
+            PathBuf::from(path)
+        }
+    } else if path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home)
+        } else {
+            PathBuf::from(path)
+        }
+    } else {
+        PathBuf::from(path)
+    }
+}
 
 pub struct ClientDaemon {
     server_host: String,
@@ -279,11 +299,14 @@ impl ClientDaemon {
 
         let start_time = std::time::Instant::now();
 
+        // Expand tilde in the relative path
+        let expanded_path = expand_tilde(&relative_path);
+
         // Construct local path relative to working directory if set
         let local_path = if let Some(ref working_dir) = self.working_dir {
-            working_dir.join(&relative_path)
+            working_dir.join(&expanded_path)
         } else {
-            std::path::PathBuf::from(&relative_path)
+            expanded_path
         };
 
         // Create parent directory if needed
@@ -495,12 +518,16 @@ impl ClientDaemon {
         working_dir: Option<&str>,
         env: &std::collections::HashMap<String, String>,
     ) -> Result<(i32, String, String)> {
-        let mut command = tokio::process::Command::new(binary);
+        // Expand tilde in binary path
+        let expanded_binary = expand_tilde(binary);
+
+        let mut command = tokio::process::Command::new(&expanded_binary);
         command.args(args);
 
-        // Set working directory if provided
+        // Set working directory if provided (expand tilde)
         if let Some(dir) = working_dir {
-            command.current_dir(dir);
+            let expanded_dir = expand_tilde(dir);
+            command.current_dir(expanded_dir);
         }
 
         // Add environment variables
