@@ -59,6 +59,39 @@ impl SshServer {
         })
     }
 
+    /// Strip the pattern's base directory from the relative path to avoid duplication.
+    ///
+    /// For example:
+    /// - Pattern: "assets/**/*", Path: "assets/data/file.json" -> "data/file.json"
+    /// - Pattern: "target/release/binary", Path: "target/release/binary" -> "binary"
+    fn strip_pattern_base(pattern: &str, relative_path: &Path) -> PathBuf {
+        // Find the first glob character in the pattern
+        let glob_pos = pattern.find(&['*', '?', '[', '{'][..]);
+
+        if let Some(pos) = glob_pos {
+            // Extract the base path before the glob
+            let base = &pattern[..pos];
+            // Remove trailing slashes and wildcards
+            let base = base.trim_end_matches('/');
+
+            if !base.is_empty() {
+                // Try to strip this base from the relative path
+                if let Ok(stripped) = relative_path.strip_prefix(base) {
+                    return stripped.to_path_buf();
+                }
+            }
+        } else {
+            // No globs in pattern - it's an exact file match
+            // Return just the filename
+            if let Some(filename) = relative_path.file_name() {
+                return PathBuf::from(filename);
+            }
+        }
+
+        // Fallback: return the path as-is
+        relative_path.to_path_buf()
+    }
+
     fn load_authorized_keys() -> Result<Vec<ssh_key::PublicKey>> {
         let home = std::env::var("HOME").context("HOME not set")?;
         let authorized_keys_path = PathBuf::from(home).join(".ssh/authorized_keys");
@@ -177,10 +210,20 @@ impl SshServer {
                                 });
 
                                 if let Some(rule) = matched_rule {
-                                    // Construct destination by joining rule's destination with the relative path
+                                    // Find which pattern matched (use first for simplicity)
+                                    let pattern = rule.include.first().map(|s| s.as_str()).unwrap_or("");
+
+                                    // Strip pattern base to avoid duplication (e.g., "assets/" from "assets/data/file.json")
+                                    let stripped_path = Self::strip_pattern_base(pattern, &relative);
+
+                                    // Construct destination by joining rule's destination with the stripped path
                                     let dest = std::path::PathBuf::from(&rule.destination);
-                                    let full_dest = dest.join(&relative_str);
+                                    let full_dest = dest.join(&stripped_path);
                                     let dest_str = full_dest.to_string_lossy().to_string();
+
+                                    log::debug!("Pattern: {}, Original: {}, Stripped: {}, Destination: {}",
+                                        pattern, relative_str, stripped_path.display(), dest_str);
+
                                     (dest_str, rule.execute.clone())
                                 } else {
                                     // No matching rule, use relative path as-is
@@ -1268,9 +1311,20 @@ impl SshSession {
                                 });
 
                                 if let Some(rule) = matched_rule {
+                                    // Find which pattern matched (use first for simplicity)
+                                    let pattern = rule.include.first().map(|s| s.as_str()).unwrap_or("");
+
+                                    // Strip pattern base to avoid duplication (e.g., "assets/" from "assets/data/file.json")
+                                    let stripped_path = SshServer::strip_pattern_base(pattern, relative_path);
+
+                                    // Construct destination by joining rule's destination with the stripped path
                                     let dest = std::path::PathBuf::from(&rule.destination);
-                                    let full_dest = dest.join(&relative_str);
+                                    let full_dest = dest.join(&stripped_path);
                                     let dest_str = full_dest.to_string_lossy().to_string();
+
+                                    log::debug!("Initial sync - Pattern: {}, Original: {}, Stripped: {}, Destination: {}",
+                                        pattern, relative_str, stripped_path.display(), dest_str);
+
                                     (dest_str, rule.execute.clone())
                                 } else {
                                     (relative_str.clone(), None)
