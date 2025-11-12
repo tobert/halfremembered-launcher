@@ -7,6 +7,7 @@ pub mod client_daemon;
 pub mod client_registry;
 pub mod config;
 pub mod file_watcher;
+pub mod otlp_exporter;
 pub mod rsync_utils;
 pub mod ssh_client;
 pub mod ssh_server;

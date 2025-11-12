@@ -36,3 +36,8 @@ notify = "7.0"
 notify-debouncer-mini = "0.5"
 globset = "0.4"
 memmap2 = "0.9"
+# OpenTelemetry for log forwarding
+opentelemetry = "0.24"
+opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic", "logs"] }
+opentelemetry_sdk = { version = "0.24", features = ["logs", "rt-tokio"] }
+tonic = "0.12"

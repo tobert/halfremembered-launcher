@@ -19,6 +19,11 @@ enum Commands {
         /// Port to listen on
         #[arg(short, long, default_value = "20222")]
         port: u16,
+
+        /// OpenTelemetry OTLP endpoint for forwarding process logs (gRPC)
+        /// Example: http://localhost:4317
+        #[arg(long)]
+        otlp_endpoint: Option<String>,
     },
 
     /// Start the client daemon (connects to server)
@@ -277,9 +282,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Server { port } => {
+        Commands::Server { port, otlp_endpoint } => {
             log::info!("Starting HalfRemembered server on port {}", port);
-            ssh_server::SshServer::run(port).await?;
+            if let Some(ref endpoint) = otlp_endpoint {
+                log::info!("OTLP endpoint configured: {}", endpoint);
+            }
+            ssh_server::SshServer::run(port, otlp_endpoint).await?;
         }
 
         Commands::Client {

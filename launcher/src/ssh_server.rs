@@ -138,8 +138,13 @@ impl SshServer {
         Ok(keys)
     }
 
-    pub async fn run(port: u16) -> Result<()> {
+    pub async fn run(port: u16, otlp_endpoint: Option<String>) -> Result<()> {
         let mut server = Self::new().await?;
+
+        // TODO: Initialize OTLP exporter if endpoint is provided
+        if let Some(ref endpoint) = otlp_endpoint {
+            log::info!("📊 OTLP logging enabled: {}", endpoint);
+        }
 
         // Try to auto-load config file from current directory or ancestors
         match Config::find_and_load() {

@@ -40,6 +40,11 @@ notify = { workspace = true }
 globset = { workspace = true }
 memmap2 = { workspace = true }
 walkdir = { workspace = true }
+# OpenTelemetry for log forwarding
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tonic = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.0"
