@@ -141,10 +141,32 @@ impl SshServer {
     pub async fn run(port: u16, otlp_endpoint: Option<String>) -> Result<()> {
         let mut server = Self::new().await?;
 
-        // TODO: Initialize OTLP exporter if endpoint is provided
-        if let Some(ref endpoint) = otlp_endpoint {
-            log::info!("📊 OTLP logging enabled: {}", endpoint);
-        }
+        // Initialize OTLP exporter if endpoint is provided
+        let _otlp_exporter = if let Some(ref endpoint) = otlp_endpoint {
+            match crate::otlp_exporter::OtlpExporter::new(endpoint) {
+                Ok(exporter) => {
+                    log::info!("✅ OTLP logging enabled: {}", endpoint);
+
+                    // Send a test log to verify connectivity
+                    exporter.send_log(
+                        "test-init",
+                        "server",
+                        "halfremembered-launcher",
+                        "stdout",
+                        "OTLP exporter initialized successfully",
+                    );
+
+                    Some(exporter)
+                }
+                Err(e) => {
+                    log::warn!("❌ Failed to initialize OTLP exporter: {:#}", e);
+                    log::warn!("Continuing without OTLP logging");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Try to auto-load config file from current directory or ancestors
         match Config::find_and_load() {

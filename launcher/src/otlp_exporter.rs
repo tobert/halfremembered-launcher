@@ -92,3 +92,12 @@ impl Drop for OtlpExporter {
         log::debug!("Shutting down OTLP exporter");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // Note: These tests require a running OTLP endpoint to fully validate.
+    // Run manual tests with: ./test-otlp.sh
+    //
+    // TODO: Add integration tests that spin up a mock OTLP collector
+}
+
