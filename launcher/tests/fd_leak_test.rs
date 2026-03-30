@@ -28,7 +28,7 @@ async fn setup_test() -> Result<TestFixture> {
 
     // Server setup
     tokio::spawn(async move {
-        if let Err(e) = SshServer::run(port).await {
+        if let Err(e) = SshServer::run(port, None).await {
             log::error!("Server failed: {:?}", e);
         }
     });

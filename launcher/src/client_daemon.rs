@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use halfremembered_protocol::{
-    ClientMessage, ClientState, Frame, ServerMessage, MSG_RSYNC_DELTA, MSG_RSYNC_SIGNATURE,
+    ClientMessage, ClientState, Frame, ServerMessage, MSG_EXEC_EXIT, MSG_EXEC_HANDSHAKE,
+    MSG_EXEC_STDERR, MSG_EXEC_STDOUT, MSG_RSYNC_DELTA, MSG_RSYNC_SIGNATURE,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time;
 
 use crate::rsync_utils;
@@ -486,60 +488,236 @@ impl ClientDaemon {
     ) -> Result<()> {
         log::info!("Executing: {} {:?}", binary, args);
 
-        let result = self
-            .execute_command(&binary, &args, working_dir.as_deref(), &env)
-            .await;
+        let conn = match self.connection.as_ref() {
+            Some(c) => c,
+            None => {
+                log::error!("No connection for exec");
+                return Ok(());
+            }
+        };
 
-        if let Some(ref conn) = self.connection {
-            let (exit_code, stdout, stderr) = match result {
-                Ok((code, out, err)) => (code, out, err),
-                Err(e) => {
-                    log::error!("Failed to execute {}: {:#}", binary, e);
-                    (-1, String::new(), format!("Execution failed: {:#}", e))
+        // Try to open a dedicated exec channel for streaming
+        match conn.open_exec_channel().await {
+            Ok(mut exec_channel) => {
+                // Send handshake with request_id and binary name
+                let payload = format!("{}\0{}", request_id, binary);
+                let handshake_frame =
+                    Frame::new(MSG_EXEC_HANDSHAKE, payload.into_bytes());
+                SshClientConnection::write_frame_to_channel(
+                    &mut exec_channel,
+                    &handshake_frame,
+                )
+                .await
+                .context("Failed to send exec handshake")?;
+
+                let result = self
+                    .execute_command_streaming(
+                        &binary,
+                        &args,
+                        working_dir.as_deref(),
+                        &env,
+                        &mut exec_channel,
+                    )
+                    .await;
+
+                let (exit_code, stdout_summary, stderr_summary) = match &result {
+                    Ok((code, out, err)) => (*code, out.clone(), err.clone()),
+                    Err(e) => {
+                        log::error!("Streaming exec failed: {:#}", e);
+                        (-1, String::new(), format!("Execution failed: {:#}", e))
+                    }
+                };
+
+                // Send exit frame
+                let exit_frame =
+                    Frame::new(MSG_EXEC_EXIT, exit_code.to_be_bytes().to_vec());
+                let _ = SshClientConnection::write_frame_to_channel(
+                    &mut exec_channel,
+                    &exit_frame,
+                )
+                .await;
+
+                drop(exec_channel);
+
+                // Send ExecComplete on control channel as summary
+                if let Some(ref conn) = self.connection {
+                    let msg = ClientMessage::ExecComplete {
+                        request_id,
+                        exit_code,
+                        stdout: stdout_summary,
+                        stderr: stderr_summary,
+                    };
+                    conn.send_message(&msg).await?;
                 }
-            };
+            }
+            Err(e) => {
+                // Fall back to buffered execution
+                log::warn!(
+                    "Failed to open exec channel, falling back to buffered: {}",
+                    e
+                );
+                let result = self
+                    .execute_command_buffered(&binary, &args, working_dir.as_deref(), &env)
+                    .await;
 
-            let msg = ClientMessage::ExecComplete {
-                request_id,
-                exit_code,
-                stdout,
-                stderr,
-            };
-            conn.send_message(&msg).await?;
+                if let Some(ref conn) = self.connection {
+                    let (exit_code, stdout, stderr) = match result {
+                        Ok((code, out, err)) => (code, out, err),
+                        Err(e) => {
+                            log::error!("Failed to execute {}: {:#}", binary, e);
+                            (-1, String::new(), format!("Execution failed: {:#}", e))
+                        }
+                    };
+
+                    let msg = ClientMessage::ExecComplete {
+                        request_id,
+                        exit_code,
+                        stdout,
+                        stderr,
+                    };
+                    conn.send_message(&msg).await?;
+                }
+            }
         }
 
         Ok(())
     }
 
-    async fn execute_command(
+    async fn execute_command_streaming(
+        &self,
+        binary: &str,
+        args: &[String],
+        working_dir: Option<&str>,
+        env: &std::collections::HashMap<String, String>,
+        exec_channel: &mut russh::Channel<russh::client::Msg>,
+    ) -> Result<(i32, String, String)> {
+        let expanded_binary = expand_tilde(binary);
+        let mut command = tokio::process::Command::new(&expanded_binary);
+        command.args(args);
+        if let Some(dir) = working_dir {
+            command.current_dir(expand_tilde(dir));
+        }
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+
+        log::info!("Spawning process (streaming): {} {:?}", binary, args);
+
+        let mut child = command
+            .spawn()
+            .context(format!("Failed to spawn process: {}", binary))?;
+
+        let stdout = child.stdout.take().context("No stdout pipe")?;
+        let stderr = child.stderr.take().context("No stderr pipe")?;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(64);
+        let tx_stdout = tx.clone();
+        let tx_stderr = tx;
+
+        let stdout_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let mut summary = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if summary.len() < 4096 {
+                            summary.push_str(&line);
+                        }
+                        let frame =
+                            Frame::new(MSG_EXEC_STDOUT, line.as_bytes().to_vec());
+                        if tx_stdout.send(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("stdout read error: {}", e);
+                        break;
+                    }
+                }
+            }
+            summary
+        });
+
+        let stderr_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            let mut summary = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if summary.len() < 4096 {
+                            summary.push_str(&line);
+                        }
+                        let frame =
+                            Frame::new(MSG_EXEC_STDERR, line.as_bytes().to_vec());
+                        if tx_stderr.send(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("stderr read error: {}", e);
+                        break;
+                    }
+                }
+            }
+            summary
+        });
+
+        // Forward frames from reader tasks to the SSH exec channel
+        while let Some(frame) = rx.recv().await {
+            if let Err(e) =
+                SshClientConnection::write_frame_to_channel(exec_channel, &frame).await
+            {
+                log::error!("Failed to write exec frame: {:#}", e);
+                break;
+            }
+        }
+
+        let stdout_summary = stdout_task.await.unwrap_or_default();
+        let stderr_summary = stderr_task.await.unwrap_or_default();
+
+        let status = child.wait().await.context("Failed to wait for process")?;
+        let exit_code = status.code().unwrap_or(-1);
+
+        log::info!(
+            "Process completed: {} (exit: {}, stdout: {} bytes, stderr: {} bytes)",
+            binary,
+            exit_code,
+            stdout_summary.len(),
+            stderr_summary.len()
+        );
+
+        Ok((exit_code, stdout_summary, stderr_summary))
+    }
+
+    /// Fallback for when exec channel can't be opened
+    async fn execute_command_buffered(
         &self,
         binary: &str,
         args: &[String],
         working_dir: Option<&str>,
         env: &std::collections::HashMap<String, String>,
     ) -> Result<(i32, String, String)> {
-        // Expand tilde in binary path
         let expanded_binary = expand_tilde(binary);
-
         let mut command = tokio::process::Command::new(&expanded_binary);
         command.args(args);
-
-        // Set working directory if provided (expand tilde)
         if let Some(dir) = working_dir {
-            let expanded_dir = expand_tilde(dir);
-            command.current_dir(expanded_dir);
+            command.current_dir(expand_tilde(dir));
         }
-
-        // Add environment variables
         for (key, value) in env {
             command.env(key, value);
         }
-
-        // Capture output
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
 
-        log::info!("Spawning process: {} {:?}", binary, args);
+        log::info!("Spawning process (buffered): {} {:?}", binary, args);
 
         let output = command
             .output()

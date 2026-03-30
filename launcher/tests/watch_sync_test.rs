@@ -187,7 +187,7 @@ include = ["**/*"]
 
     // Start the server in a background task
     let server_task = tokio::spawn(async move {
-        halfremembered_launcher::ssh_server::SshServer::run(test_port)
+        halfremembered_launcher::ssh_server::SshServer::run(test_port, None)
             .await
             .expect("Server failed to start");
     });

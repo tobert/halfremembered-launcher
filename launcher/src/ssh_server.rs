@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use halfremembered_protocol::{
     ClientMessage, Frame, FrameBuffer, LocalCommand, LocalResponse, MessageBuffer, ServerMessage,
-    MSG_RSYNC_DELTA, MSG_RSYNC_SIGNATURE,
+    MSG_EXEC_HANDSHAKE, MSG_EXEC_EXIT, MSG_EXEC_STDERR, MSG_EXEC_STDOUT, MSG_RSYNC_DELTA,
+    MSG_RSYNC_SIGNATURE,
 };
 use rand_core::OsRng;
 use russh::keys::*;
@@ -38,6 +39,7 @@ pub struct SshServer {
     sync_rules: Arc<Mutex<Option<(PathBuf, Vec<crate::config::SyncRule>)>>>, // (project_root, rules)
     start_time: Arc<Instant>,
     rsync_semaphore: Arc<tokio::sync::Semaphore>,
+    otlp_exporter: Option<Arc<crate::otlp_exporter::OtlpExporter>>,
 }
 
 impl SshServer {
@@ -56,6 +58,7 @@ impl SshServer {
             sync_rules: Arc::new(Mutex::new(None)),
             start_time: Arc::new(Instant::now()),
             rsync_semaphore: Arc::new(tokio::sync::Semaphore::new(5)), // Limit to 5 concurrent rsyncs
+            otlp_exporter: None,
         })
     }
 
@@ -142,12 +145,11 @@ impl SshServer {
         let mut server = Self::new().await?;
 
         // Initialize OTLP exporter if endpoint is provided
-        let _otlp_exporter = if let Some(ref endpoint) = otlp_endpoint {
+        server.otlp_exporter = if let Some(ref endpoint) = otlp_endpoint {
             match crate::otlp_exporter::OtlpExporter::new(endpoint) {
                 Ok(exporter) => {
-                    log::info!("✅ OTLP logging enabled: {}", endpoint);
+                    log::info!("OTLP logging enabled: {}", endpoint);
 
-                    // Send a test log to verify connectivity
                     exporter.send_log(
                         "test-init",
                         "server",
@@ -156,10 +158,10 @@ impl SshServer {
                         "OTLP exporter initialized successfully",
                     );
 
-                    Some(exporter)
+                    Some(Arc::new(exporter))
                 }
                 Err(e) => {
-                    log::warn!("❌ Failed to initialize OTLP exporter: {:#}", e);
+                    log::warn!("Failed to initialize OTLP exporter: {:#}", e);
                     log::warn!("Continuing without OTLP logging");
                     None
                 }
@@ -1074,6 +1076,9 @@ impl russh::server::Server for SshServer {
             sync_rules: self.sync_rules.clone(),
             start_time: self.start_time.clone(),
             rsync_semaphore: self.rsync_semaphore.clone(),
+            otlp_exporter: self.otlp_exporter.clone(),
+            pending_channels: HashMap::new(),
+            exec_channels: HashMap::new(),
         }
     }
 }
@@ -1091,15 +1096,10 @@ struct RsyncChannelState {
     frame_buffer: FrameBuffer,
 }
 
-impl RsyncChannelState {
-    fn new() -> Self {
-        Self {
-            request_id: None,
-            file_path: None,
-            file_data: None,
-            frame_buffer: FrameBuffer::new(),
-        }
-    }
+struct ExecChannelState {
+    request_id: Option<String>,
+    binary: Option<String>,
+    frame_buffer: FrameBuffer,
 }
 
 pub struct SshSession {
@@ -1117,6 +1117,9 @@ pub struct SshSession {
     sync_rules: Arc<Mutex<Option<(PathBuf, Vec<crate::config::SyncRule>)>>>,
     start_time: Arc<Instant>,
     rsync_semaphore: Arc<tokio::sync::Semaphore>,
+    otlp_exporter: Option<Arc<crate::otlp_exporter::OtlpExporter>>,
+    pending_channels: HashMap<ChannelId, FrameBuffer>,
+    exec_channels: HashMap<ChannelId, ExecChannelState>,
 }
 
 impl russh::server::Handler for SshSession {
@@ -1172,9 +1175,9 @@ impl russh::server::Handler for SshSession {
             log::debug!("Setting control channel: {:?}", channel_id);
             self.control_channel_id = Some(channel_id);
         } else {
-            // Additional channels are rsync channels
-            log::debug!("Detected rsync channel: {:?}", channel_id);
-            self.rsync_channels.insert(channel_id, RsyncChannelState::new());
+            // Additional channels are pending until we see the first frame
+            log::debug!("New subchannel (pending classification): {:?}", channel_id);
+            self.pending_channels.insert(channel_id, FrameBuffer::new());
         }
 
         Ok(true)
@@ -1186,9 +1189,15 @@ impl russh::server::Handler for SshSession {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Check if this is an rsync channel
+        // Route to the appropriate channel handler
+        if self.pending_channels.contains_key(&channel) {
+            return self.handle_pending_channel_data(channel, data, session).await;
+        }
         if self.rsync_channels.contains_key(&channel) {
             return self.handle_rsync_data(channel, data, session).await;
+        }
+        if self.exec_channels.contains_key(&channel) {
+            return self.handle_exec_data(channel, data, session).await;
         }
 
         // Control channel data
@@ -1507,11 +1516,26 @@ impl SshSession {
                     request_id,
                     exit_code
                 );
+                let hostname = self.hostname.as_deref().unwrap_or("unknown");
                 if !stdout.is_empty() {
-                    log::debug!("stdout: {}", stdout);
+                    for line in stdout.lines() {
+                        log::info!("[{}] stdout: {}", request_id, line);
+                    }
+                    if let Some(ref exporter) = self.otlp_exporter {
+                        for line in stdout.lines() {
+                            exporter.send_log(&request_id, hostname, "exec", "stdout", line);
+                        }
+                    }
                 }
                 if !stderr.is_empty() {
-                    log::debug!("stderr: {}", stderr);
+                    for line in stderr.lines() {
+                        log::warn!("[{}] stderr: {}", request_id, line);
+                    }
+                    if let Some(ref exporter) = self.otlp_exporter {
+                        for line in stderr.lines() {
+                            exporter.send_log(&request_id, hostname, "exec", "stderr", line);
+                        }
+                    }
                 }
             }
 
@@ -1790,5 +1814,157 @@ impl Drop for SshSession {
                 }
             });
         }
+    }
+}
+
+impl SshSession {
+    async fn handle_pending_channel_data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        let frame_buffer = self
+            .pending_channels
+            .get_mut(&channel)
+            .expect("pending channel must exist");
+        frame_buffer.append(data);
+
+        if let Some(msg_type) = frame_buffer.peek_message_type() {
+            let frame_buffer = self.pending_channels.remove(&channel).unwrap();
+            match msg_type {
+                MSG_RSYNC_SIGNATURE => {
+                    log::debug!("Classified channel {:?} as rsync", channel);
+                    let state = RsyncChannelState {
+                        request_id: None,
+                        file_path: None,
+                        file_data: None,
+                        frame_buffer,
+                    };
+                    self.rsync_channels.insert(channel, state);
+                    return self.handle_rsync_data(channel, &[], session).await;
+                }
+                MSG_EXEC_HANDSHAKE => {
+                    log::debug!("Classified channel {:?} as exec", channel);
+                    let state = ExecChannelState {
+                        request_id: None,
+                        binary: None,
+                        frame_buffer,
+                    };
+                    self.exec_channels.insert(channel, state);
+                    return self.handle_exec_data(channel, &[], session).await;
+                }
+                other => {
+                    log::warn!(
+                        "Unknown first frame type on channel {:?}: 0x{:04x}",
+                        channel,
+                        other
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_exec_data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        _session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        let state = self
+            .exec_channels
+            .get_mut(&channel)
+            .expect("exec channel must exist");
+        state.frame_buffer.append(data);
+
+        let mut should_remove = false;
+
+        loop {
+            let frame = match state.frame_buffer.try_parse() {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(e) => {
+                    log::error!("Frame parse error on exec channel: {:#}", e);
+                    return Err(russh::Error::from(std::io::Error::other(e)));
+                }
+            };
+
+            match frame.message_type {
+                MSG_EXEC_HANDSHAKE => {
+                    let payload_str = String::from_utf8(frame.payload).map_err(|e| {
+                        russh::Error::from(std::io::Error::other(format!(
+                            "Invalid exec handshake: {}",
+                            e
+                        )))
+                    })?;
+                    let (request_id, binary) = if let Some(idx) = payload_str.find('\0') {
+                        (
+                            payload_str[..idx].to_string(),
+                            payload_str[idx + 1..].to_string(),
+                        )
+                    } else {
+                        (payload_str, "unknown".to_string())
+                    };
+                    log::info!(
+                        "Exec channel handshake: request={}, binary={}",
+                        request_id,
+                        binary
+                    );
+                    state.request_id = Some(request_id);
+                    state.binary = Some(binary);
+                }
+                MSG_EXEC_STDOUT => {
+                    let line = String::from_utf8_lossy(&frame.payload);
+                    let request_id = state.request_id.as_deref().unwrap_or("unknown");
+                    let hostname = self.hostname.as_deref().unwrap_or("unknown");
+                    let binary = state.binary.as_deref().unwrap_or("unknown");
+
+                    log::info!("[{}] stdout: {}", request_id, line.trim_end());
+                    if let Some(ref exporter) = self.otlp_exporter {
+                        exporter.send_log(request_id, hostname, binary, "stdout", &line);
+                    }
+                }
+                MSG_EXEC_STDERR => {
+                    let line = String::from_utf8_lossy(&frame.payload);
+                    let request_id = state.request_id.as_deref().unwrap_or("unknown");
+                    let hostname = self.hostname.as_deref().unwrap_or("unknown");
+                    let binary = state.binary.as_deref().unwrap_or("unknown");
+
+                    log::warn!("[{}] stderr: {}", request_id, line.trim_end());
+                    if let Some(ref exporter) = self.otlp_exporter {
+                        exporter.send_log(request_id, hostname, binary, "stderr", &line);
+                    }
+                }
+                MSG_EXEC_EXIT => {
+                    let exit_code = if frame.payload.len() >= 4 {
+                        i32::from_be_bytes([
+                            frame.payload[0],
+                            frame.payload[1],
+                            frame.payload[2],
+                            frame.payload[3],
+                        ])
+                    } else {
+                        -1
+                    };
+                    let request_id = state.request_id.as_deref().unwrap_or("unknown");
+                    log::info!("[{}] process exited: {}", request_id, exit_code);
+                    should_remove = true;
+                }
+                other => {
+                    log::warn!(
+                        "Unexpected frame type on exec channel: 0x{:04x}",
+                        other
+                    );
+                }
+            }
+        }
+
+        if should_remove {
+            self.exec_channels.remove(&channel);
+        }
+
+        Ok(())
     }
 }

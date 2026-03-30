@@ -446,6 +446,21 @@ impl SshClientConnection {
         }
     }
 
+    /// Open a dedicated exec channel for streaming process output
+    pub async fn open_exec_channel(&self) -> Result<Channel<client::Msg>> {
+        log::debug!("Attempting to open exec channel...");
+        match self.session.channel_open_session().await {
+            Ok(channel) => {
+                log::debug!("Successfully opened exec channel");
+                Ok(channel)
+            }
+            Err(e) => {
+                log::error!("Failed to open exec channel: {:#}", e);
+                Err(anyhow::anyhow!("Failed to open exec channel: {:#}", e))
+            }
+        }
+    }
+
     /// Read a frame from a channel
     /// Blocks until a complete frame is received
     pub async fn read_frame_from_channel(

@@ -175,6 +175,15 @@ impl FrameBuffer {
         }))
     }
 
+    /// Peek at the message type of the next frame without consuming it.
+    /// Returns None if not enough data is available for a complete header.
+    pub fn peek_message_type(&self) -> Option<u16> {
+        if self.buffer.len() < FRAME_HEADER_SIZE {
+            return None;
+        }
+        Some(u16::from_be_bytes([self.buffer[4], self.buffer[5]]))
+    }
+
     /// Get remaining bytes in buffer
     pub fn remaining(&self) -> usize {
         self.buffer.len()
@@ -401,6 +410,27 @@ mod tests {
         assert_eq!(frame1, frame2);
         assert_eq!(frame1.message_type, frame2.message_type);
         assert_eq!(frame1.payload, frame2.payload);
+    }
+
+    #[test]
+    fn test_frame_buffer_peek_message_type() {
+        let frame = Frame::new(0x0150, vec![1, 2, 3]);
+        let mut buf = Vec::new();
+        frame.write(&mut buf).unwrap();
+
+        let mut frame_buffer = FrameBuffer::new();
+
+        // Not enough data yet
+        frame_buffer.append(&buf[..3]);
+        assert_eq!(frame_buffer.peek_message_type(), None);
+
+        // Now we have enough for the header
+        frame_buffer.append(&buf[3..]);
+        assert_eq!(frame_buffer.peek_message_type(), Some(0x0150));
+
+        // Peek doesn't consume — still parseable
+        let parsed = frame_buffer.try_parse().unwrap().unwrap();
+        assert_eq!(parsed.message_type, 0x0150);
     }
 
     #[test]
