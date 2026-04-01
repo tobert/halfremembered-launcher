@@ -62,6 +62,34 @@ impl SshServer {
         })
     }
 
+    /// Strip debug symbols from a binary, writing the stripped copy to a temp file.
+    /// Returns the NamedTempFile handle — the file is deleted when the handle is dropped.
+    async fn strip_binary(path: &Path) -> Result<tempfile::NamedTempFile> {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let temp = tempfile::NamedTempFile::new_in(parent)
+            .context("Failed to create temp file for strip")?;
+        let status = tokio::process::Command::new("strip")
+            .arg("-o")
+            .arg(temp.path())
+            .arg(path)
+            .status()
+            .await
+            .context("Failed to run strip")?;
+        if !status.success() {
+            anyhow::bail!("strip exited with status {}", status);
+        }
+        let original_size = tokio::fs::metadata(path).await.map(|m| m.len()).unwrap_or(0);
+        let stripped_size = tokio::fs::metadata(temp.path()).await.map(|m| m.len()).unwrap_or(0);
+        log::info!(
+            "Stripped {}: {} -> {} ({:.0}% reduction)",
+            path.display(),
+            original_size,
+            stripped_size,
+            (1.0 - stripped_size as f64 / original_size as f64) * 100.0
+        );
+        Ok(temp)
+    }
+
     /// Strip the pattern's base directory from the relative path to avoid duplication.
     ///
     /// For example:
@@ -213,8 +241,8 @@ impl SshServer {
                         let _permit = semaphore.acquire().await.unwrap();
                         log::debug!("Acquired semaphore permit for {}", absolute.display());
 
-                        // Find which sync rule matches this file to get destination and execute config
-                        let (destination_path, exec_config) = {
+                        // Find which sync rule matches this file to get destination, execute config, and strip flag
+                        let (destination_path, exec_config, should_strip) = {
                             let rules_lock = sync_rules.lock().await;
                             if let Some((project_root, rules)) = rules_lock.as_ref() {
                                 // Find the first rule that matches this file
@@ -253,22 +281,37 @@ impl SshServer {
                                     log::debug!("Pattern: {}, Original: {}, Stripped: {}, Destination: {}",
                                         pattern, relative_str, stripped_path.display(), dest_str);
 
-                                    (dest_str, rule.execute.clone())
+                                    (dest_str, rule.execute.clone(), rule.strip)
                                 } else {
-                                    // No matching rule, use relative path as-is
-                                    (relative_str.clone(), None)
+                                    (relative_str.clone(), None, false)
                                 }
                             } else {
-                                // No sync rules configured, use relative path as-is
-                                (relative_str.clone(), None)
+                                (relative_str.clone(), None, false)
                             }
+                        };
+
+                        // Strip debug symbols if configured
+                        let (sync_path, _strip_handle) = if should_strip {
+                            match SshServer::strip_binary(&absolute).await {
+                                Ok(temp) => {
+                                    let stripped_path = temp.path().to_string_lossy().to_string();
+                                    log::info!("Stripped {} for sync", absolute.display());
+                                    (stripped_path, Some(temp))
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to strip {}, syncing unstripped: {:#}", absolute.display(), e);
+                                    (absolute.to_string_lossy().to_string(), None)
+                                }
+                            }
+                        } else {
+                            (absolute.to_string_lossy().to_string(), None)
                         };
 
                         // Sync with or without execute config
                         let result = if let Some(config) = exec_config {
                             log::debug!("File has execute config: {}", config.command);
                             Self::sync_file_to_clients_with_exec(
-                                &absolute.to_string_lossy(),
+                                &sync_path,
                                 &destination_path,
                                 registry,
                                 storage,
@@ -277,7 +320,7 @@ impl SshServer {
                             ).await
                         } else {
                             Self::sync_file_to_clients(
-                                &absolute.to_string_lossy(),
+                                &sync_path,
                                 &destination_path,
                                 registry,
                                 storage,
@@ -789,7 +832,12 @@ impl SshServer {
         };
 
         // Compute checksum
-        let checksum = rsync_utils::compute_checksum(&file_data);
+        let checksum = {
+            let data = file_data.clone();
+            tokio::task::spawn_blocking(move || rsync_utils::compute_checksum(&data))
+                .await
+                .context("checksum task panicked")?
+        };
 
         // Choose block size
         let block_size = rsync_utils::choose_block_size(size);
@@ -901,7 +949,12 @@ impl SshServer {
         };
 
         // Compute checksum
-        let checksum = rsync_utils::compute_checksum(&file_data);
+        let checksum = {
+            let data = file_data.clone();
+            tokio::task::spawn_blocking(move || rsync_utils::compute_checksum(&data))
+                .await
+                .context("checksum task panicked")?
+        };
 
         // Choose block size
         let block_size = rsync_utils::choose_block_size(size);
@@ -996,7 +1049,12 @@ impl SshServer {
         };
 
         // Compute checksum
-        let checksum = rsync_utils::compute_checksum(&file_data);
+        let checksum = {
+            let data = file_data.clone();
+            tokio::task::spawn_blocking(move || rsync_utils::compute_checksum(&data))
+                .await
+                .context("checksum task panicked")?
+        };
 
         // Choose block size
         let block_size = rsync_utils::choose_block_size(size);
@@ -1307,8 +1365,13 @@ impl SshSession {
                 if initial_sync {
                     let watcher_lock = self.file_watcher.lock().await;
                     if let Some(watcher) = watcher_lock.as_ref() {
-                    let watched_files = watcher.get_all_watched_files();
+                    let mut watched_files = watcher.get_all_watched_files();
                     drop(watcher_lock); // Release lock before async operations
+
+                    // Sort by file size ascending so small files (assets) sync first
+                    watched_files.sort_by_key(|(_, _, abs_path)| {
+                        std::fs::metadata(abs_path).map(|m| m.len()).unwrap_or(u64::MAX)
+                    });
 
                     if !watched_files.is_empty() {
                         let file_count = watched_files.len();
@@ -1325,8 +1388,8 @@ impl SshSession {
                             let file_path_str = absolute_path.to_string_lossy().to_string();
                             let relative_str = relative_path.to_string_lossy().to_string();
 
-                            // Find matching sync rule to get destination and execute config
-                            let (destination_path, exec_config) = if let Some((project_root, rules)) = &sync_rules {
+                            // Find matching sync rule to get destination, execute config, and strip flag
+                            let (destination_path, exec_config, should_strip) = if let Some((project_root, rules)) = &sync_rules {
                                 let matched_rule = rules.iter().find(|rule| {
                                     use globset::{Glob, GlobSetBuilder};
                                     let mut builder = GlobSetBuilder::new();
@@ -1361,12 +1424,12 @@ impl SshSession {
                                     log::debug!("Initial sync - Pattern: {}, Original: {}, Stripped: {}, Destination: {}",
                                         pattern, relative_str, stripped_path.display(), dest_str);
 
-                                    (dest_str, rule.execute.clone())
+                                    (dest_str, rule.execute.clone(), rule.strip)
                                 } else {
-                                    (relative_str.clone(), None)
+                                    (relative_str.clone(), None, false)
                                 }
                             } else {
-                                (relative_str.clone(), None)
+                                (relative_str.clone(), None, false)
                             };
 
                             log::info!("Queueing file {}/{}: {} -> {}", idx + 1, file_count, file_path_str, destination_path);
@@ -1387,10 +1450,27 @@ impl SshSession {
                                 let _permit = semaphore_clone.acquire().await.unwrap();
                                 log::debug!("Initial sync starting: {}", file_path_str);
 
+                                // Strip debug symbols if configured
+                                let (sync_path, _strip_handle) = if should_strip {
+                                    match SshServer::strip_binary(Path::new(&file_path_str)).await {
+                                        Ok(temp) => {
+                                            let stripped = temp.path().to_string_lossy().to_string();
+                                            log::info!("Stripped {} for initial sync", file_path_str);
+                                            (stripped, Some(temp))
+                                        }
+                                        Err(e) => {
+                                            log::warn!("Failed to strip {}, syncing unstripped: {:#}", file_path_str, e);
+                                            (file_path_str.clone(), None)
+                                        }
+                                    }
+                                } else {
+                                    (file_path_str.clone(), None)
+                                };
+
                                 let result = if exec_config.is_some() {
                                     log::debug!("Initial sync with execute config: {}", file_path_str);
                                     SshServer::sync_file_to_client_with_exec(
-                                        &file_path_str,
+                                        &sync_path,
                                         &destination_path,
                                         &hostname_clone,
                                         &session_id_clone,
@@ -1401,7 +1481,7 @@ impl SshSession {
                                     ).await
                                 } else {
                                     SshServer::sync_file_to_client(
-                                        &file_path_str,
+                                        &sync_path,
                                         &destination_path,
                                         &hostname_clone,
                                         &session_id_clone,
@@ -1685,13 +1765,23 @@ impl SshSession {
                             })?
                             .clone();
 
-                        let delta = rsync_utils::generate_delta(&file_data, &frame.payload)
-                            .map_err(|e| {
-                                russh::Error::from(std::io::Error::other(format!(
-                                    "Failed to generate delta: {:#}",
-                                    e
-                                )))
-                            })?;
+                        let signature_data = frame.payload;
+                        let delta = tokio::task::spawn_blocking(move || {
+                            rsync_utils::generate_delta(&file_data, &signature_data)
+                        })
+                        .await
+                        .map_err(|e| {
+                            russh::Error::from(std::io::Error::other(format!(
+                                "delta task panicked: {:#}",
+                                e
+                            )))
+                        })?
+                        .map_err(|e| {
+                            russh::Error::from(std::io::Error::other(format!(
+                                "Failed to generate delta: {:#}",
+                                e
+                            )))
+                        })?;
 
                         log::debug!("Generated delta: {} bytes", delta.len());
 

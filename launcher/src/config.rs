@@ -64,6 +64,11 @@ pub struct SyncRule {
     #[serde(default)]
     pub mirror: bool,
 
+    /// Optional: If true, strip debug symbols before syncing
+    /// Runs `strip -o <temp> <binary>` and syncs the stripped copy
+    #[serde(default)]
+    pub strip: bool,
+
     /// Optional: Execute configuration to run after files are synced
     #[serde(default)]
     pub execute: Option<ExecuteConfig>,
