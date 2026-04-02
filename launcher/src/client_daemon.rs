@@ -13,6 +13,32 @@ use tokio::time;
 use crate::rsync_utils;
 use crate::ssh_client::SshClientConnection;
 
+/// Write file contents, handling ETXTBSY by unlinking the busy file first.
+///
+/// On Unix, writing to a currently-executing binary fails with ETXTBSY.
+/// Unlinking removes the directory entry while running processes keep
+/// their inode reference. The retry creates a fresh inode at the same path.
+#[cfg(unix)]
+async fn write_with_unlink_retry(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    match tokio::fs::write(path, contents).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+            log::info!(
+                "File is busy (ETXTBSY), unlinking before retry: {}",
+                path.display()
+            );
+            tokio::fs::remove_file(path).await?;
+            tokio::fs::write(path, contents).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(unix))]
+async fn write_with_unlink_retry(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    tokio::fs::write(path, contents).await
+}
+
 /// Expand tilde (~) in paths to the user's home directory
 fn expand_tilde(path: &str) -> PathBuf {
     if path.starts_with("~/") {
@@ -417,8 +443,7 @@ impl ClientDaemon {
         if success {
             log::debug!("Checksum verified for {}", relative_path);
 
-            // Write the file
-            tokio::fs::write(&local_path, &new_content)
+            write_with_unlink_retry(&local_path, &new_content)
                 .await
                 .context("Failed to write file")?;
 
@@ -737,5 +762,71 @@ impl ClientDaemon {
         );
 
         Ok((exit_code, stdout, stderr))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_write_with_unlink_retry_on_busy_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("busy.sh");
+
+        // Write a script that sleeps, make it executable
+        tokio::fs::write(&script_path, "#!/bin/sh\nsleep 60\n")
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        // Spawn it so the kernel holds the inode as ETXTBSY
+        let mut child = tokio::process::Command::new(&script_path)
+            .spawn()
+            .expect("failed to spawn script");
+
+        // Overwrite while it's running — should unlink and retry
+        let new_content = b"#!/bin/sh\necho replaced\n";
+        write_with_unlink_retry(&script_path, new_content)
+            .await
+            .expect("write_with_unlink_retry failed");
+
+        let on_disk = tokio::fs::read(&script_path).await.unwrap();
+        assert_eq!(on_disk, new_content);
+
+        child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_with_unlink_retry_normal_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("normal.txt");
+
+        tokio::fs::write(&path, b"original").await.unwrap();
+
+        write_with_unlink_retry(&path, b"updated")
+            .await
+            .expect("write_with_unlink_retry failed on normal file");
+
+        let on_disk = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(on_disk, b"updated");
+    }
+
+    #[tokio::test]
+    async fn test_write_with_unlink_retry_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+
+        write_with_unlink_retry(&path, b"fresh")
+            .await
+            .expect("write_with_unlink_retry failed on new file");
+
+        let on_disk = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(on_disk, b"fresh");
     }
 }
