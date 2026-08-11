@@ -162,6 +162,30 @@ enum Commands {
         agent_socket: Option<String>,
     },
 
+    /// Show the deploy history of a file installed by this tool (LOCAL command)
+    ///
+    /// Runs on the machine holding the file — no server or network needed.
+    /// That is the point: it has to work when the thing you broke is how you
+    /// reach the box.
+    Versions {
+        /// Path to the installed file
+        path: PathBuf,
+    },
+
+    /// Roll a file back to the previously deployed version (LOCAL command)
+    ///
+    /// Runs on the machine holding the file. The stored version is verified
+    /// against its checksum before installation; a corrupt one is refused and
+    /// the live file left alone.
+    Rollback {
+        /// Path to the installed file
+        path: PathBuf,
+
+        /// How many versions to retain after the rollback
+        #[arg(long, default_value_t = halfremembered_launcher::versioned_install::DEFAULT_KEEP)]
+        keep: usize,
+    },
+
     /// Get server status (server-side command)
     Status {
         /// Server connection string (user@host or just host, defaults to $USER@localhost)
@@ -564,6 +588,39 @@ async fn main() -> Result<()> {
                     println!("✓ Server start command issued on {}:{}", host, port);
                 }
             }
+        }
+
+        Commands::Versions { path } => {
+            use halfremembered_launcher::versioned_install as vi;
+            let history = vi::history(&path)?;
+            if history.is_empty() {
+                println!("No deploy history for {} (not installed by this tool, or never versioned)", path.display());
+                return Ok(());
+            }
+            println!("{:<14} {:>10}  {:<20} {:>6}  {}", "VERSION", "SIZE", "INSTALLED (UTC)", "MODE", "");
+            for (i, v) in history.iter().enumerate() {
+                let when = format_epoch(v.installed_at);
+                let marker = if i == 0 { "<- live" } else { "" };
+                println!(
+                    "{:<14} {:>10} {:<20} {:>6o}  {}",
+                    v.short(),
+                    v.size,
+                    when,
+                    v.mode.unwrap_or(0),
+                    marker
+                );
+            }
+        }
+
+        Commands::Rollback { path, keep } => {
+            use halfremembered_launcher::versioned_install as vi;
+            let from = vi::current(&path)?;
+            let to = vi::rollback(&path, keep).await?;
+            match from {
+                Some(f) => println!("Rolled {} back: {} -> {}", path.display(), f.short(), to.short()),
+                None => println!("Rolled {} back to {}", path.display(), to.short()),
+            }
+            println!("Restart whatever runs it for the change to take effect.");
         }
 
         Commands::Status {
@@ -974,5 +1031,36 @@ fn format_duration(seconds: u64) -> String {
         format!("{}m {}s", minutes, secs)
     } else {
         format!("{}s", secs)
+    }
+}
+
+/// Render a unix timestamp as **UTC** `YYYY-MM-DD HH:MM:SS`, without pulling in
+/// a date crate for one line of output. Callers must label it UTC: showing a
+/// bare timestamp that is silently four hours off the reader's clock is the
+/// kind of small lie that costs someone an hour during an incident.
+fn format_epoch(secs: u64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    let t = UNIX_EPOCH + Duration::from_secs(secs);
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => {
+            let days = d.as_secs() / 86400;
+            let rem = d.as_secs() % 86400;
+            // civil-from-days (Howard Hinnant's algorithm)
+            let z = days as i64 + 719468;
+            let era = z.div_euclid(146097);
+            let doe = z.rem_euclid(146097);
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+            let y = yoe + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d_ = doy - (153 * mp + 2) / 5 + 1;
+            let m = if mp < 10 { mp + 3 } else { mp - 9 };
+            let y = if m <= 2 { y + 1 } else { y };
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                y, m, d_, rem / 3600, (rem % 3600) / 60, rem % 60
+            )
+        }
+        Err(_) => "unknown".to_string(),
     }
 }

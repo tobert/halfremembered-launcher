@@ -13,6 +13,7 @@ use tokio::time;
 use crate::atomic_install;
 use crate::rsync_utils;
 use crate::ssh_client::SshClientConnection;
+use crate::versioned_install;
 
 /// Expand tilde (~) in paths to the user's home directory
 fn expand_tilde(path: &str) -> PathBuf {
@@ -428,10 +429,48 @@ impl ClientDaemon {
             // permitted, and running processes keep their old inode just as
             // they did with the unlink trick — without the window in which the
             // path had no file at all.
-            atomic_install::install_atomic(&local_path, &new_content, Some(mode))
+            // Executables get version history and rollback; everything else is
+            // installed atomically without a sidecar.
+            //
+            // The executable bit is a heuristic, and a deliberate one: this
+            // tool's fleet job is shipping binaries to machines we may not be
+            // able to reach afterwards, and that is exactly when "put the old
+            // one back" has to work without the network. Config and data files
+            // sync as before, so no destination grows a `.hrl-versions/`
+            // directory it did not need.
+            //
+            // TODO the honest long-term answer is a per-sync-rule setting in
+            // .hrlauncher.toml, so the choice is declared rather than inferred.
+            // Gap 3 in docs/plans/halfremembered-launcher-sprucing.md.
+            let is_executable = mode & 0o111 != 0;
+            if is_executable {
+                let outcome = versioned_install::install_versioned(
+                    &local_path,
+                    &new_content,
+                    Some(mode),
+                    versioned_install::DEFAULT_KEEP,
+                )
                 .await
                 .context("Failed to install file")?;
-            log::debug!("Installed {} with mode {:o}", relative_path, mode);
+                match &outcome {
+                    versioned_install::Installed::Replaced(v) => log::info!(
+                        "Installed {} version {} (mode {:o})",
+                        relative_path,
+                        v.short(),
+                        mode
+                    ),
+                    versioned_install::Installed::Unchanged(v) => log::info!(
+                        "{} already at version {} — nothing written",
+                        relative_path,
+                        v.short()
+                    ),
+                }
+            } else {
+                atomic_install::install_atomic(&local_path, &new_content, Some(mode))
+                    .await
+                    .context("Failed to install file")?;
+                log::debug!("Installed {} with mode {:o}", relative_path, mode);
+            }
 
             let elapsed = start_time.elapsed();
             log::info!(

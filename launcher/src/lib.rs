@@ -12,3 +12,4 @@ pub mod otlp_exporter;
 pub mod rsync_utils;
 pub mod ssh_client;
 pub mod ssh_server;
+pub mod versioned_install;
