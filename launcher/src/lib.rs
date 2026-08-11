@@ -3,6 +3,7 @@
 // This module exposes the core functionality for integration testing
 // and potential future library use.
 
+pub mod atomic_install;
 pub mod client_daemon;
 pub mod client_registry;
 pub mod config;
