@@ -52,6 +52,8 @@ halfremembered-launcher.exe
 
 # But don't ignore these specific markdown files
 !README.md
-!BOTS.md
+!AGENTS.md
+!CLAUDE.md
 !CONFIG.md
 !botdocs/01-feat-notify-plan.md
+!docs/agents/*.md
