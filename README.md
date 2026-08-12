@@ -1,327 +1,187 @@
-# HalfRemembered Launcher
+# HalfRemembered Launcher 🚀
 
-A secure, persistent SSH-based RPC system for syncing build artifacts and launching binaries across machines. Inspired
-by OpenSSH's ControlMaster architecture, it provides server-initiated push capabilities to clients behind NAT/dynamic
-IPs while maintaining SSH security.
+> Push files and run programs on remote machines through persistent SSH connections
 
-## 🚀 Self-Deployment Setup
+HalfRemembered Launcher is a tool that lets you push files and execute commands on remote machines that connect to your build server. Think of it as "reverse SSH" - clients behind NAT or firewalls connect to your server, then you can push builds and launch programs on them. Perfect for deploying game builds, syncing binaries to test machines, or running commands across your fleet.
 
-The launcher can build and sync itself to client machines.
-
-**Prerequisites**: SSH agent with keys loaded (`ssh-add -l`), Rust toolchain, and for Windows builds: `mingw-w64-gcc` and `x86_64-pc-windows-gnu` target.
-
-### 1. Build on Your Development Machine
-
-```bash
-# Install Linux binary to ~/.cargo/bin
-cargo install --path launcher
-
-# Optional: Build for Windows (requires cross-compile toolchain)
-rustup target add x86_64-pc-windows-gnu
-# Arch: sudo pacman -S mingw-w64-gcc nasm
-# Ubuntu: sudo apt install gcc-mingw-w64-x86-64 nasm
-./build-windows.sh
-```
-
-### 2. Start Server and Connect Clients
-
-```bash
-# Terminal 1: Start server on build machine
-# The server auto-detects .hrlauncher.toml and configures watches
-halfremembered-launcher server
-
-# Get the scp command to run on your client
-echo "scp $USER@$(hostname):~/.cargo/bin/halfremembered-launcher ~/.cargo/bin/"
-
-# Terminal 2: On your laptop/client machine, run that scp command, then:
-halfremembered-launcher client buildmachine
-```
-
-The included `.hrlauncher.toml` is **automatically loaded** when you start the server. The server walks up from the current directory (like git does) to find the config file and configures watches for all sync rules.
-
-> 💡 **New in this version**: No need to run `config-sync` separately! The server auto-configures on startup.
-
-### 3. Build and Auto-Deploy
-
-With the server running and clients connected, any new builds sync automatically to connected clients:
-
-```bash
-# Linux build → syncs to all clients
-cargo build --release
-
-# Windows build → syncs to all clients
-./build-windows.sh
-```
-
-Edit `.hrlauncher.toml` to customize sync paths and targets.
+**Key features:**
+- 🔒 **Secure**: Everything over SSH, no custom protocols
+- 📡 **NAT-friendly**: Clients connect outbound only (no port forwarding needed)
+- ⚡ **Efficient**: Uses rsync algorithm to transfer only changed data
+- 🎮 **User context**: Runs in your environment with access to graphics, audio, etc.
+- 🪟 **Cross-platform**: Linux, WSL, and Windows
+- ↩️ **Reversible**: Executables keep deploy history, so a bad build rolls back on the machine itself
 
 ## Quick Start
 
-Get up and running in four steps. This guide assumes your SSH agent is running and has keys loaded (`ssh-add -l`).
-
-**1. Build the Project**
-
-First, compile the project in release mode.
+**Prerequisites:** SSH agent running with a key loaded (`ssh-add -l` should show your key)
 
 ```bash
+# 1. Build the project
 cargo build --release
-```
 
-**2. Start the Server**
-
-Open a terminal and run the server. It will listen for clients on the default port (20222).
-
-```bash
+# 2. Start the server (in one terminal)
 ./target/release/halfremembered-launcher server
-```
 
-**3. Connect a Client**
-
-Open a second terminal in the same directory. Run the client and enable info-level logging to see it connect.
-
-```bash
+# 3. Connect a client (in another terminal)
 ./target/release/halfremembered-launcher client localhost
+
+# 4. Push a file from a third terminal
+./target/release/halfremembered-launcher sync Cargo.toml \
+    --destination /tmp/Cargo.toml \
+    --server localhost
 ```
 
-> **What to Expect**: You should see log messages from the client confirming it has registered with the server, followed by periodic heartbeats. This indicates a successful connection.
-
-**4. Sync a File**
-
-In a third terminal, use the `sync` command to transfer a file to the connected client. Let's sync the `Cargo.toml` file as an example. Note that management commands also need the server address.
-
-```bash
-./target/release/halfremembered-launcher sync Cargo.toml --destination /tmp/Cargo.toml --server localhost
-```
-
-To verify, you can check the contents of `/tmp/Cargo.toml` on the client machine. You've just synced your first file! For more advanced options, see the **Usage** section below.
-
-## Architecture Overview
-
-The launcher uses persistent SSH connections with multiplexed channels for bidirectional communication:
-
-```mermaid
-graph LR
-    subgraph Client["Client Machine"]
-        CD[Client Daemon<br/>Control Loop]
-        SC[SSH Client<br/>russh]
-        CD --> SC
-    end
-
-    subgraph Server["Server Machine (Port 20222)"]
-        SS[SSH Server<br/>russh]
-        CH[Session Handler<br/>- Rsync Engine<br/>- Exec Handler]
-        CR[Client Registry]
-        SS --> CH
-        SS --> CR
-    end
-
-    SC <-->|Multiplexed Channels<br/>- Control<br/>- Rsync<br/>- Heartbeat| SS
-```
-
-### Key Features
-
-- **Persistent SSH Connections**: Single authenticated connection per client, multiplexed for all operations
-- **Efficient Delta Sync**: Built-in rsync algorithm transfers only changed blocks, minimizing bandwidth
-- **Server Push**: Server can initiate file transfers and commands to connected clients
-- **NAT/Firewall Friendly**: Clients establish outbound connections only
-- **User Context**: Client runs in user environment with full access to graphics, audio, etc.
-- **Self-Deploying**: Binary can bootstrap itself to remote machines
-- **Cross-Platform**: Works on Linux, WSL, and native Windows
-- **No System Services**: Runs entirely in user space, no systemd/Windows services needed
-
-### Communication Flow
-
-1. **Client connects to server** via SSH on port 20222 (outbound connection)
-2. **Authenticates** using ssh-agent (no private key handling)
-3. **Registers capabilities** and hostname with server
-4. **Maintains persistent connection** with heartbeats
-5. **Server pushes commands** through control channel using bincode protocol:
-   - File sync operations (rsync delta algorithm over dedicated channel)
-   - Binary execution requests
-   - Status queries
-6. **Client multiplexes operations** over single SSH connection
-7. **Efficient transfers**: Rsync engine calculates signatures and transfers only changed blocks
-
-### Technical Details
-
-- **Server**: Pure Rust SSH server (`russh`) on port 20222 with ephemeral Ed25519 keys
-- **Client**: Pure Rust SSH client (`russh`) with ssh-agent authentication only
-- **Wire Protocol**: Length-prefixed bincode (compact binary, ~3x smaller than JSON)
-- **File Transfer**: Rsync algorithm (`fast_rsync` crate) for efficient delta synchronization
-- **Authorization**: Server reads `~/.ssh/authorized_keys` for authorized keys
-- **Configuration**: CLI flags with sensible defaults (everything configurable)
-- **Async Runtime**: Tokio for all I/O operations (client and server)
+That's it! Check `/tmp/Cargo.toml` on your client - the file was pushed through the persistent SSH connection.
 
 ## Installation
 
-### Prerequisites
+```bash
+# Install to ~/.cargo/bin
+cargo install --path launcher
 
-- Rust 1.85+ (`rustup` recommended)
-- SSH agent with at least one key loaded (`ssh-add`)
-- Ed25519 key recommended
+# Now you can just run:
+halfremembered-launcher server
+```
 
-### Building
+For Windows builds and cross-compilation, see [docs/CROSS_COMPILE.md](docs/CROSS_COMPILE.md).
+
+## Basic Usage
+
+### Running the Server
+
+Start the server on a machine that clients can reach:
 
 ```bash
-# Linux build
-cargo build --release
-
-# Windows cross-compile (from Linux/WSL)
-./build-windows.sh
+halfremembered-launcher server              # Default port 20222
+halfremembered-launcher server --port 1337  # Custom port
 ```
+
+### Connecting Clients
+
+Clients establish outbound SSH connections to the server:
+
+```bash
+halfremembered-launcher client localhost                    # Same machine
+halfremembered-launcher client user@example.com            # Remote server
+halfremembered-launcher client user@server.local:1337     # Custom port
+```
+
+### Managing Clients
+
+Use these commands to interact with connected clients (run from any machine that can SSH to the server):
+
+```bash
+# List connected clients
+halfremembered-launcher list --server user@localhost
+
+# Push a file to all clients
+halfremembered-launcher sync ./my-game.exe \
+    --destination ~/games/my-game.exe \
+    --server user@localhost
+
+# Run a command on a specific client
+halfremembered-launcher exec laptop01 ~/games/my-game.exe \
+    --server user@localhost
+```
+
+### Undoing a Bad Deploy
+
+Executables are installed with version history, so a bad build can be undone
+on the machine itself:
+
+```bash
+# Run these ON the machine holding the file
+halfremembered-launcher versions ~/games/my-game   # what was deployed, and when
+halfremembered-launcher rollback ~/games/my-game   # put the previous one back
+```
+
+These are deliberately **local** commands. They need no server, no network and
+no build machine, because the case they exist for is the one where the thing
+you broke is how you reach the box. The previous version is stored beside the
+file and verified against its checksum before it is put back — a corrupted
+stored version is refused rather than installed over a working binary.
+
+Every install is atomic: the destination is never a partial file, never
+briefly missing, and never briefly non-executable. Executables are also
+checked against the target's glibc before activation and refused if that
+machine could not run them, which turns a program that dies on start into a
+deploy that fails loudly.
 
 ## Platform Setup
 
 ### Linux
 
-**Setup SSH agent:**
 ```bash
-# Ensure ssh-agent is running
-echo $SSH_AUTH_SOCK  # Should show a path
-eval $(ssh-agent)    # If not running
-
-# Add your key
+# Ensure SSH agent is running
+eval $(ssh-agent)
 ssh-add ~/.ssh/id_ed25519
-```
-
-**Run client:**
-```bash
-# Basic
-./target/release/halfremembered-launcher client user@server
-
+ssh-add -l  # Verify
 ```
 
 ### Windows
 
-**Setup OpenSSH Agent:**
 ```powershell
-# Enable and start service
+# Start OpenSSH agent service
 Get-Service ssh-agent | Set-Service -StartupType Automatic
 Start-Service ssh-agent
 
-# Add key
+# Add your key
 ssh-add C:\Users\YourName\.ssh\id_ed25519
 ssh-add -l  # Verify
 ```
 
-**Run client:**
-```powershell
-# Basic
-.\halfremembered-launcher.exe client user@server
+## Use Cases
+
+- **Game Development**: Build on your workstation, auto-deploy to test machines
+- **Cross-Platform Testing**: Push builds to Windows, Linux, and WSL simultaneously
+- **Remote Execution**: Launch programs on machines behind NAT/firewalls
+- **Lab Management**: Sync tools and run commands across multiple machines
+
+## Documentation
+
+- [Building and Installation](docs/BUILDING.md) - Detailed build instructions
+- [Cross-Compilation for Windows](docs/CROSS_COMPILE.md) - Using xwin for Windows builds
+- [Architecture](docs/ARCHITECTURE.md) - How it works under the hood
+- [Configuration](CONFIG.md) - Auto-sync configuration with `.hrlauncher.toml`
+- [Agent Contributors](AGENTS.md) - Guide for AI coding assistants
+
+## How It Works
+
+Clients establish persistent SSH connections to the server. The server multiplexes multiple operations (file transfers, commands, heartbeats) over each connection. When you push a file, the server uses rsync delta algorithm to transfer only the changed parts, then the client writes it atomically to disk.
 
 ```
+┌─────────────┐         SSH          ┌─────────────┐
+│   Client    │◄─────────────────────┤   Server    │
+│  (behind    │  Persistent tunnel   │  (port      │
+│   NAT)      │  + multiplexed ops   │   20222)    │
+└─────────────┘                      └─────────────┘
+```
 
-**Alternative**: Use Pageant (PuTTY's agent) - russh auto-detects it.
+For technical details, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-### Platform Notes
+## Troubleshooting
 
-| Feature | Linux | Windows PowerShell | Notes |
-|---------|-------|-------------------|-------|
-| SSH Agent | `ssh-agent` | OpenSSH Agent service or Pageant | Both fully supported |
-| Binary | Native ELF | Static .exe (no DLLs) | Single file deployment |
-| File Paths | Unix paths | Windows paths auto-handled | Rust handles conversion |
-| Permissions | chmod via Rust API | Not needed on Windows | Conditional compilation |
-| Logging | `RUST_LOG=debug ./binary` | `$env:RUST_LOG="debug"` | Different env syntax |
-| Networking | Pure Rust (russh) | Pure Rust (russh) | Identical implementation |
-
-### Troubleshooting
-
-**Check SSH agent:**
+**Connection issues?**
 ```bash
-ssh-add -l  # List loaded keys (works on both Linux and Windows)
+# Check SSH agent
+ssh-add -l
+
+# Enable debug logging
+RUST_LOG=debug halfremembered-launcher client user@server
+
+# Test SSH connectivity
+ssh -p 20222 user@server
 ```
 
-**Test connection manually:**
-```bash
-ssh -p 20222 user@server  # Should work before launcher will
-```
+**Windows path issues?**
+- Use forward slashes: `/c/Users/name/file.txt` or `C:/Users/name/file.txt`
+- Or Windows style: `C:\Users\name\file.txt` (backslashes work too)
 
-**Enable debug logging:**
-```bash
-# Linux
-RUST_LOG=debug ./target/release/halfremembered-launcher client user@server
+## About
 
-# Windows PowerShell
-$env:RUST_LOG="debug"; .\halfremembered-launcher.exe client user@server
-```
+Created by [Amy Tobey](https://github.com/tobert) with [Claude Code](https://claude.ai/code) and [Gemini](https://gemini.google.com). An experiment in AI-assisted open source development and shell script harm reduction.
 
-## Usage
+## License
 
-### Start the Server
-
-Run the server daemon on a publicly accessible machine.
-
-```bash
-# Start on the default port (20222)
-./target/release/halfremembered-launcher server
-
-# Start on a custom port
-./target/release/halfremembered-launcher server --port 1337
-```
-
-### Start a Client
-
-The client connects to the server and waits for commands. The `<SERVER>` argument can be a simple hostname or a full `user@host:port` string.
-
-```bash
-# Connect to a server on the same machine
-./target/release/halfremembered-launcher client localhost
-
-# Connect to a remote server with a specific user
-./target/release/halfremembered-launcher client alice@example.com
-
-# Connect to a remote server with a custom port
-./target/release/halfremembered-launcher client bob@dev-server.local:1337
-
-# Connect with custom heartbeat and reconnect intervals
-./target/release/halfremembered-launcher client server.example.com --heartbeat 60 --reconnect 10
-```
-
-### Server Management Commands
-
-Management commands are sent to the server to control clients. The `--server` argument specifies the server to connect to, and defaults to `$USER@localhost` if not provided.
-
-```bash
-# List connected clients
-./target/release/halfremembered-launcher list --server user@localhost
-
-# Ping a specific client
-./target/release/halfremembered-launcher ping laptop01 --server user@localhost
-
-# Execute a command on a client
-./target/release/halfremembered-launcher exec laptop01 ./myapp arg1 arg2 --server user@localhost
-
-# Sync a file to all connected clients
-./target/release/halfremembered-launcher sync /path/to/local/file --destination /remote/path/file --server user@localhost
-
-# Get server status
-./target/release/halfremembered-launcher status --server user@localhost
-
-# Shutdown the server
-./target/release/halfremembered-launcher shutdown --server user@localhost
-```
-
-### Bootstrap/Deploy
-
-You can use the `push` command to deploy the launcher binary to a new machine.
-
-```bash
-# Push binary to a server and start it
-./target/release/halfremembered-launcher push user@server \
-    --binary ./target/release/halfremembered-launcher \
-    --destination ~/halfremembered-launcher \
-    --start
-```
-
-## Security
-
-- All communication over SSH (encrypted, authenticated)
-- SSH agent authentication (no password/key storage)
-- No listening ports on client machines
-- Server authenticates clients via SSH keys
-
-## About This Project
-
-HalfRemembered Launcher was collaboratively developed by **Amy Tobey**, **Claude Code** (Anthropic's AI coding assistant), and **Gemini** (Google's AI coding assistant). This project demonstrates how human creativity and AI capabilities can combine to scratch an itch. This all could have been a shell script but Amy had agents write most of the code as an experiment in shell script harm reduction and trying some bot-driven OSS.
-
-Agent contributors must read [BOTS.md](BOTS.md).
+MIT - See [LICENSE](LICENSE)
