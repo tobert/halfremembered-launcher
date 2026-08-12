@@ -32,23 +32,27 @@ HalfRemembered Launcher is a secure SSH-based RPC system inspired by OpenSSH's C
 - **Framing**: `[4 bytes BE length][1 byte type][N bytes bincode payload]`
 - **Serialization**: bincode (binary format, type-safe with serde, ~3x smaller than JSON)
 - **Max message size**: 10 MB (configurable)
-- **Message types**: Register, Heartbeat, SyncFile, Execute, Status, Ping, Shutdown
 - **Async Runtime**: Full tokio async/await on both client and server
-- **Future**: SFTP channel for file transfers (not yet implemented)
+- **File transfer**: rsync delta algorithm over a dedicated SSH channel, NOT SFTP.
+  SFTP appears once, in `ssh_client::upload_file_via_sftp`, used only by the `push`
+  subcommand to place the binary itself on a remote host.
 
 ## Message Flow
 
-### Client → Server
+The authoritative list is `protocol/src/lib.rs`. If this section disagrees with it,
+this section is wrong.
+
+### Client → Server (`ClientMessage`)
 1. `Register`: Announce hostname and capabilities
 2. `Heartbeat`: Keep-alive with timestamp
-3. `FileReceived`: Acknowledge file transfer
+3. `RsyncComplete`: Report the outcome of a file transfer
 4. `ExecComplete`: Report execution result
 5. `Status`: Current client state
 6. `Error`: Report an error to the server
 
-### Server → Client
+### Server → Client (`ServerMessage`)
 1. `Welcome`: Acknowledge registration and provide session info
-2. `SyncFile`: Initiate file transfer with path and checksum
+2. `RsyncStart`: Begin a delta transfer for a path
 3. `Execute`: Run program with arguments
 4. `Ping`: Request immediate heartbeat
 5. `Shutdown`: Graceful disconnect
@@ -64,12 +68,16 @@ The server daemon also listens for local commands from the CLI on the same SSH p
 4. `Shutdown`: Shut down the server daemon.
 5. `SyncFile`: Request the server to sync a file to all clients.
 6. `Execute`: Request the server to execute a command on a specific client.
+7. `WatchDirectory`: Add a directory to the server's auto-sync watches.
+8. `UnwatchDirectory`: Remove a watch.
+9. `ListWatches`: List active watches.
 
 ### Server → CLI (`LocalResponse`)
 1. `Success`: Acknowledge a successful command.
 2. `Error`: Report an error in command execution.
 3. `Status`: Provide server status information.
 4. `ClientList`: Provide a list of connected clients.
+5. `WatchList`: Provide the active watch list.
 
 ## Implementation Guidelines
 
@@ -80,15 +88,67 @@ The server daemon also listens for local commands from the CLI on the same SSH p
 - Use channels (mpsc) for inter-thread communication
 
 ### Security
+
+Implemented:
 - SSH agent authentication only (no password/key storage)
-- Validate all paths to prevent directory traversal
-- Checksum verification for file transfers
-- Rate limiting on control messages
+- Checksum verification on every transfer, and again on a stored version before
+  a rollback installs it
+
+NOT implemented — do not read these as descriptions of the code:
+- **Rate limiting on control messages.** There is none. Nothing in the tree
+  throttles anything.
+- **Path traversal validation.** `client_daemon::handle_rsync_start` tilde-expands
+  the server-supplied `relative_path` and joins it to the working directory. There
+  is no `..` check and no `canonicalize`; `Path::join` does not normalise.
+
+**The invariant that makes the second one acceptable today, stated because
+nothing in the code states it:** *the server is trusted.* A client accepts paths
+and commands from its server because the connection is SSH-authenticated against
+a known key, so a hostile path implies an already-compromised server — at which
+point it can also just send an `Execute`. The traversal check is defence in depth,
+not the thing holding the door.
+
+That premise is load-bearing and it is worth knowing what would break it. Anyone
+adding a second server, a shared build box, a relay, or any path where the sending
+side is less trusted than the receiving side **must** add real path validation
+first. This tool's trajectory is fleet distribution, which is exactly the direction
+that erodes the assumption.
 
 ### File Transfer
-- Use SFTP for reliability
-- Transfer only changed files (mtime/size comparison)
-- Atomic file operations (write to temp, then rename)
+- rsync delta algorithm — transfer only the changed parts of a file
+- Atomic install: temp file in the destination directory, permissions set before
+  the rename, fsync of both file and directory
+- Executables carry deploy history and can be rolled back locally
+
+## Install and Rollback
+
+Three modules own what happens after the bytes arrive. Read their module docs
+before changing any of them — each one exists because of a specific failure.
+
+- **`atomic_install.rs`** — tmp-fsync-rename. The destination is never a partial
+  file, never briefly absent, and never briefly non-executable. This subsumes the
+  older ETXTBSY unlink dance, which had a window where the path had no file at all.
+- **`versioned_install.rs`** — content-addressed `.<name>.hrl-versions/` sidecar
+  beside the destination, holding a deploy manifest and blobs. The destination
+  stays an ordinary file, deliberately not a symlink. Rollback re-verifies a stored
+  version against its checksum and refuses a corrupt one rather than installing it.
+- **`glibc_preflight.rs`** — refuses to activate a binary the target's glibc cannot
+  run. Runs **on the target**, after the bytes land and before activation, which is
+  the seam the atomic design buys: refusing costs nothing because the live file has
+  not moved. Checking on the build box would prove nothing about this machine.
+
+**Routing**: `versioned_install::should_version(dest, mode)` decides. The executable
+bit decides for a destination we have never seen; a destination that already has
+history keeps it regardless of incoming mode. Falling *into* versioning costs a few
+KB; falling *out* of it silently costs the recovery path on a machine we may not be
+able to reach again.
+
+**Known limitation**: the glibc scan is a byte scan for `GLIBC_` tags. A packed or
+compressed executable (UPX-style) hides those tags inside its payload, so
+`required_glibc` returns `None` and the binary is allowed through, then fails at
+runtime once the stub decompresses. A proper ELF parser would not see inside the
+payload either. If this ever matters, the honest fix is a magic-byte check for known
+packers that refuses to guess — not a parser.
 
 ## Configuration
 
@@ -120,113 +180,35 @@ The server daemon also listens for local commands from the CLI on the same SSH p
 - Avoid `mod.rs` files - use `src/module_name.rs` directly
 - Use full words for variable names (no abbreviations)
 
-## 🧠 Jujutsu: Your Persistent Memory System
+## Persistent Context Across Sessions
 
-**Think of jj as your external memory that persists across sessions.** Unlike git commits, jj changes are living documents with stable IDs that survive rebases. Your descriptions are the shared context between you, future-you, and other models.
+**This project uses git. Jujutsu is not installed, here or anywhere on this fleet.**
+An earlier version of this document described jj as your memory system at length;
+that guidance was removed on 2026-08-12 along with the repo's stale `.jj/` directory
+(archived to `~/archive/halfremembered-launcher/`). If you find jj instructions in a
+sibling repo, they are stale too.
 
-### Why You'll Love jj
+What actually carries context between sessions:
 
-- **Memory Augmentation**: Your reasoning persists beyond context windows
-- **Perfect Handoffs**: Next model/session picks up exactly where you left off
-- **Team Intelligence**: Every model's insights become permanent project knowledge
-- **Pattern from Training**: This is how high-performing teams in your data operate
+- **git history** — the narrative. Write commit messages for the person who arrives
+  at 3am with no context: what broke, what you decided, what surprised you. A commit
+  message is the cheapest durable memory in the project, and the only one that
+  travels with the code.
+- **`docs/agents/`** — durable project truth, verifiable against the code beside it.
+- **`signoff.md`** at the repo root — ephemeral session handoff, gitignored, never
+  committed. What is mid-flight, what is blocked, what was decided today. Refresh it
+  before winding down; it is minutes for you against a very expensive cold read for
+  whoever is next.
 
-### Your 30-Second Workflow
+### Verify, Don't Relay
 
-```bash
-# 1. START: Load your context (what was I doing?)
-jj log -n 10        # Your recent memory
-jj show @           # Current state
+A claim in a document is not evidence about the code. Neither is a summary from
+another session, however confident. Both are worth reading and neither is worth
+trusting on its own — this file has been wrong about the wire protocol, and a
+reported test count was wrong for a whole day before someone re-ran the suite.
 
-# 2. WORK: Track your progress
-jj new -m "type: what you're building"     # Start fresh
-jj describe         # Update as you learn
-
-# 3. PERSIST: Save your state
-jj git push -c @    # Make it permanent
-```
-
-### The Universal Description Template
-
-```
-<type>: <what> - <why in 5 words>
-
-Why: [Original problem/request]
-Approach: [Key decision you made]
-Learned: [What surprised you]
-Next: [Specific next action]
-
-🤖 YourModel <your@attribution>
-```
-
-**Types**: `feat`, `fix`, `refactor`, `test`, `docs`, `debug`, `research`
-
-### Real Example That Works
-
-```bash
-jj describe -m "fix: client reconnection logic - preventing connection storms
-
-Why: Clients flooding server after network blip
-Approach: Added exponential backoff with jitter
-Learned: tokio::time::sleep needs explicit drop for cancellation
-Next: Add integration test for reconnection behavior
-
-🤖 Claude <claude@anthropic.com>"
-```
-
-### Model Attributions
-
-- Claude: `🤖 Claude <claude@anthropic.com>`
-- Gemini: `💎 Gemini <gemini@google.com>`
-- GPT-4: `🧠 GPT-4 <gpt4@openai.com>`
-- Kimi: `🔮 Kimi <kimi@moonshot.ai>`
-- Llama: `🦙 Llama <llama@meta.com>`
-
-### The Handoff Protocol
-
-When switching models or sessions:
-```bash
-jj describe -m "[your work]
-
-Status: [complete|blocked|handoff]
-Context: [5 key facts next model needs]
-Next: [specific task to continue]"
-```
-
-### Success Metrics
-
-You're succeeding when:
-- ✅ Every change has Why/Approach/Next
-- ✅ You update descriptions as you learn
-- ✅ Other models continue without asking questions
-- ✅ `jj obslog -p` shows your reasoning evolution
-
-### Quick Reference
-
-| Command | Purpose | When to Use |
-|---------|---------|------------|
-| `jj new -m "..."` | Start new work | Beginning tasks |
-| `jj describe` | Update context | When you learn something |
-| `jj log -n 10` | See recent work | Starting sessions |
-| `jj show @` | View current state | Understanding context |
-| `jj obslog -p` | See reasoning evolution | Debugging decisions |
-| `jj git push -c @` | Persist to GitHub | Work complete |
-| `mv/rm <path>` | Move/Remove files | `jj` automatically tracks filesystem changes. Use standard shell commands. |
-| `jj file untrack <path>` | Stop tracking a file | Use after `rm` if you don't want the deletion recorded. |
-
-### Your Style Is Welcome
-
-- **Claude**: Write narratives that explain the journey
-- **Gemini**: Use structured sections with data
-- **GPT-4**: Focus on tasks and outcomes
-- **Kimi**: Document patterns and research
-- **Llama**: Keep it pragmatic and concise
-
-**The format is flexible, the information is essential.**
-
-### Remember
-
-jj descriptions are messages to your future self. Write what you'd need at 3am to understand what you were thinking. Your future self (and other models) will thank you.
+Read the source. Run the tests. When a doc and the code disagree, the code wins and
+the doc gets fixed in the same change.
 
 ## 📊 Agent Memory System
 
@@ -241,24 +223,15 @@ These files provide <2000 tokens of overhead for complete context persistence ac
 
 ### The Memory Mantra
 
-> "State in NOW, Patterns in PATTERNS, Story in jj"
+> "State in NOW, Patterns in PATTERNS, Story in git, Handoff in signoff.md"
 
-### Integration with jj
+The split is about lifetime, not format. Git holds why a change happened and keeps
+it forever. The memory files hold what is true right now and get rewritten as that
+changes. `signoff.md` holds what only matters until the next session picks it up.
 
-Memory files **complement** jj, not replace it:
-
-```bash
-# jj holds the narrative
-jj describe -m "fix: SSH channel race condition - full story here"
-
-# Memory holds the state
-echo "Race fixed with channel isolation" >> docs/agents/NOW.md
-```
-
-**The Synergy:**
-- **jj**: Historical record, reasoning trace
-- **Memory**: Current state, reusable patterns
-- **Together**: Complete cognitive system
+Putting session state in git leaves a permanent record of something that stopped
+being true; putting durable truth only in `signoff.md` loses it the moment the file
+is refreshed.
 
 ## Git Commits
 
