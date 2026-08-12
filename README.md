@@ -103,10 +103,7 @@ file and verified against its checksum before it is put back — a corrupted
 stored version is refused rather than installed over a working binary.
 
 Every install is atomic: the destination is never a partial file, never
-briefly missing, and never briefly non-executable. Executables are also
-checked against the target's glibc before activation and refused if that
-machine could not run them, which turns a program that dies on start into a
-deploy that fails loudly.
+briefly missing, and never briefly non-executable.
 
 ## Platform Setup
 

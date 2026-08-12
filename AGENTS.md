@@ -122,8 +122,8 @@ that erodes the assumption.
 
 ## Install and Rollback
 
-Three modules own what happens after the bytes arrive. Read their module docs
-before changing any of them — each one exists because of a specific failure.
+Two modules own what happens after the bytes arrive. Read their module docs
+before changing either — each exists because of a specific failure.
 
 - **`atomic_install.rs`** — tmp-fsync-rename. The destination is never a partial
   file, never briefly absent, and never briefly non-executable. This subsumes the
@@ -132,23 +132,30 @@ before changing any of them — each one exists because of a specific failure.
   beside the destination, holding a deploy manifest and blobs. The destination
   stays an ordinary file, deliberately not a symlink. Rollback re-verifies a stored
   version against its checksum and refuses a corrupt one rather than installing it.
-- **`glibc_preflight.rs`** — refuses to activate a binary the target's glibc cannot
-  run. Runs **on the target**, after the bytes land and before activation, which is
-  the seam the atomic design buys: refusing costs nothing because the live file has
-  not moved. Checking on the build box would prove nothing about this machine.
-
 **Routing**: `versioned_install::should_version(dest, mode)` decides. The executable
 bit decides for a destination we have never seen; a destination that already has
 history keeps it regardless of incoming mode. Falling *into* versioning costs a few
 KB; falling *out* of it silently costs the recovery path on a machine we may not be
 able to reach again.
 
-**Known limitation**: the glibc scan is a byte scan for `GLIBC_` tags. A packed or
-compressed executable (UPX-style) hides those tags inside its payload, so
-`required_glibc` returns `None` and the binary is allowed through, then fails at
-runtime once the stub decompresses. A proper ELF parser would not see inside the
-payload either. If this ever matters, the honest fix is a magic-byte check for known
-packers that refuses to guess — not a parser.
+**Deliberately not done: no glibc preflight.** A `glibc_preflight` module existed
+briefly and was removed on 2026-08-12. It scanned an incoming binary for `GLIBC_`
+symbol tags and refused to activate one the target's glibc was too old to run.
+
+It was removed because it was preemptive. Its own commit said so: build box and
+target measured identical glibc, so the argument was trajectory rather than an
+observed failure. Amy's call — *"I'm ok with handling the occasional failure."*
+
+If you are considering adding it back, know what you are trading. The reasoning
+was sound: glibc symbol versioning is one-directional, so a build box on a rolling
+distro drifts ahead of an appliance target by default, and the failure lands at
+service start looking like a bad build. But it never fired, it cost ~143 lines of
+non-test code, it was blind to packed executables (the tags hide inside the
+compressed payload, so it silently passed them), and it read the local version by
+scraping `ldd --version` output on the target. Rollback already covers the failure
+it was preventing, and it covers it whatever the cause.
+
+The removed code is in git history at `f58bf0b`.
 
 ## Configuration
 

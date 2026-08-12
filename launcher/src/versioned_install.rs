@@ -50,7 +50,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_install::install_atomic;
-use crate::glibc_preflight;
 use crate::rsync_utils::compute_checksum;
 
 /// How many distinct versions to retain by default, including the live one.
@@ -193,29 +192,6 @@ pub async fn install_versioned(
     let blob = blob_path(dest, &checksum);
     if !blob.exists() {
         install_atomic(&blob, contents, Some(0o600)).await?;
-    }
-
-    // Preflight, ON THE TARGET, after the bytes land and BEFORE activation.
-    // This is the seam the atomic design buys us: the content is here and
-    // verified, the live file has not moved, so refusing costs nothing.
-    // Checking on the build box would prove nothing about this machine, which
-    // is the entire point.
-    //
-    // Only for things meant to be executed — "which glibc does this config
-    // file need" is not a coherent question.
-    //
-    // Deliberately NOT an auto-rollback. A silent revert to an older binary
-    // hides the real problem and leaves someone wondering why the deploy
-    // "worked" while nothing changed. Refuse loudly; rollback stays a decision
-    // made with the diagnosis in hand.
-    let is_exec = mode.is_some_and(|m| m & 0o111 != 0);
-    if is_exec {
-        glibc_preflight::check(contents).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("preflight failed for {}: {e}", dest.display()),
-            )
-        })?;
     }
 
     install_atomic(dest, contents, mode).await?;
@@ -598,51 +574,6 @@ mod tests {
         assert_eq!(blobs.len(), 2, "A stored twice: {blobs:?}");
         assert!(blob_path(&dest, &compute_checksum(b"A")).exists());
         assert_eq!(read(&dest), "A");
-    }
-
-    /// The whole point of preflighting before activation: a binary this
-    /// machine cannot run must not replace one it can.
-    #[tokio::test]
-    async fn a_binary_needing_a_newer_glibc_is_refused_and_the_live_one_survives() {
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("binary");
-
-        install(&dest, "working binary", 0o755).await;
-
-        let local = crate::glibc_preflight::local_glibc().unwrap();
-        let too_new = format!("built elsewhere GLIBC_{}.{}\0", local.0, local.1 + 50);
-
-        let err = install_versioned(&dest, too_new.as_bytes(), Some(0o755), DEFAULT_KEEP)
-            .await
-            .expect_err("should have refused a binary requiring a newer glibc");
-
-        assert!(err.to_string().contains("preflight failed"), "unhelpful: {err}");
-        assert_eq!(
-            read(&dest),
-            "working binary",
-            "a refused deploy must leave the previously working binary in place"
-        );
-        assert_eq!(
-            history(&dest).unwrap().len(),
-            1,
-            "a refused deploy must not enter the history"
-        );
-    }
-
-    /// ...but a non-executable is not subject to it, because "which glibc does
-    /// this config need" is not a question.
-    #[tokio::test]
-    async fn a_non_executable_is_not_glibc_preflighted() {
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("config.toml");
-
-        let local = crate::glibc_preflight::local_glibc().unwrap();
-        let text = format!("note = \"mentions GLIBC_{}.{} in prose\"\n", local.0, local.1 + 50);
-
-        install_versioned(&dest, text.as_bytes(), Some(0o644), DEFAULT_KEEP)
-            .await
-            .expect("a config file should not be glibc-checked");
-        assert_eq!(read(&dest), text);
     }
 
     #[tokio::test]
