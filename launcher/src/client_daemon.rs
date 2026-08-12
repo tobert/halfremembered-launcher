@@ -430,7 +430,10 @@ impl ClientDaemon {
             // they did with the unlink trick — without the window in which the
             // path had no file at all.
             // Executables get version history and rollback; everything else is
-            // installed atomically without a sidecar.
+            // installed atomically without a sidecar. A destination that
+            // already has history keeps it regardless of the incoming mode —
+            // see `versioned_install::should_version` for why that asymmetry
+            // matters.
             //
             // The executable bit is a heuristic, and a deliberate one: this
             // tool's fleet job is shipping binaries to machines we may not be
@@ -442,8 +445,7 @@ impl ClientDaemon {
             // TODO the honest long-term answer is a per-sync-rule setting in
             // .hrlauncher.toml, so the choice is declared rather than inferred.
             // Gap 3 in docs/plans/halfremembered-launcher-sprucing.md.
-            let is_executable = mode & 0o111 != 0;
-            if is_executable {
+            if versioned_install::should_version(&local_path, mode) {
                 let outcome = versioned_install::install_versioned(
                     &local_path,
                     &new_content,

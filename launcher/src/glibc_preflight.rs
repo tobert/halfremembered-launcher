@@ -233,9 +233,16 @@ mod tests {
 
 #[cfg(test)]
 mod cross_check {
-    /// Cross-check our string-scanning extractor against `objdump -T`, an
-    /// independent implementation that actually parses ELF. Agreement on real
-    /// binaries is much stronger evidence than our own fixtures.
+    /// Cross-check our string-scanning extractor against `objdump -T`. This
+    /// guards the *parser*: two implementations reading the same bytes should
+    /// extract the same version strings, and on real binaries that is much
+    /// stronger evidence than our own fixtures.
+    ///
+    /// It does NOT validate the premise. objdump is another *static* reader of
+    /// the same declarations, so it shares our blind spot: the authority on
+    /// what a binary actually requires is `ld.so` at exec time, and neither
+    /// tool runs it. Agreement here means "we read the ELF correctly" — never
+    /// "this binary will load over there."
     #[test]
     fn agrees_with_objdump_on_real_binaries() {
         if std::process::Command::new("objdump").arg("--version").output().is_err() {

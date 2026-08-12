@@ -227,6 +227,35 @@ pub async fn install_versioned(
     Ok(Installed::Replaced(version))
 }
 
+/// Does `dest` already carry deploy history?
+///
+/// Deliberately the *directory*, not the manifest: a deploy that died between
+/// creating the sidecar and writing the manifest leaves the directory with a
+/// blob and no manifest, and that destination is still one we have started
+/// versioning. Treating it as unversioned would resume the silent downgrade
+/// this predicate exists to prevent.
+pub fn is_versioned(dest: &Path) -> bool {
+    store_dir(dest).exists()
+}
+
+/// Should a deploy of `dest` with `mode` be versioned?
+///
+/// The executable bit decides for a destination we have never seen. It must
+/// NOT decide for one that already has history: the same path redeployed
+/// without `+x` — a mode that changed upstream, a rule that syncs a wrapper
+/// script, a file that stopped being a binary — would otherwise route to a
+/// plain atomic install, replace the live file, and leave the manifest naming
+/// a version that is no longer on disk. `current()` would then report a lie
+/// and a later rollback would restore the wrong bytes.
+///
+/// The asymmetry is the point. Falling *into* versioning costs a few KB of
+/// sidecar. Falling *out* of it silently costs the recovery path on a machine
+/// we may not be able to reach again — so a destination that has version
+/// history keeps it.
+pub fn should_version(dest: &Path, mode: u32) -> bool {
+    mode & 0o111 != 0 || is_versioned(dest)
+}
+
 /// Does the live file currently hold exactly this content?
 fn dest_matches(dest: &Path, checksum: &str) -> bool {
     match std::fs::read(dest) {
@@ -349,6 +378,21 @@ mod tests {
         install_versioned(dest, body.as_bytes(), Some(mode), DEFAULT_KEEP)
             .await
             .expect("install failed")
+    }
+
+    /// Mirrors the routing decision the client daemon makes on an incoming
+    /// sync, so the rule is exercised here rather than only inside a method
+    /// that needs a live SSH connection to reach.
+    async fn deploy(dest: &Path, body: &str, mode: u32) {
+        if should_version(dest, mode) {
+            install_versioned(dest, body.as_bytes(), Some(mode), DEFAULT_KEEP)
+                .await
+                .expect("versioned install failed");
+        } else {
+            install_atomic(dest, body.as_bytes(), Some(mode))
+                .await
+                .expect("atomic install failed");
+        }
     }
 
     fn read(dest: &Path) -> String {
@@ -652,5 +696,71 @@ mod tests {
         let torn = torn.lock().unwrap();
         assert!(torn.is_empty(), "rollback was observed torn at sizes {torn:?}");
         assert_eq!(std::fs::read(&dest).unwrap(), old);
+    }
+
+    #[tokio::test]
+    async fn a_destination_with_history_keeps_it_when_redeployed_without_the_exec_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("binary");
+
+        deploy(&dest, "v1", 0o755).await;
+        // The same destination, redeployed with a mode that has no +x. Before
+        // the routing looked at the sidecar, this fell through to a plain
+        // atomic install: the live file changed and the manifest did not.
+        deploy(&dest, "v2", 0o644).await;
+
+        assert_eq!(read(&dest), "v2");
+
+        let live = current(&dest)
+            .unwrap()
+            .expect("history must survive a non-executable redeploy");
+        assert_eq!(
+            live.checksum,
+            compute_checksum(b"v2"),
+            "manifest says {} is live but the file on disk is v2",
+            live.short()
+        );
+        assert_eq!(history(&dest).unwrap().len(), 2, "both deploys must be recorded");
+    }
+
+    #[tokio::test]
+    async fn rollback_after_a_non_executable_redeploy_restores_the_previous_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("binary");
+
+        deploy(&dest, "good", 0o755).await;
+        deploy(&dest, "bad", 0o644).await;
+        assert_eq!(read(&dest), "bad");
+
+        // The consequence that matters: rollback is the thing that has to work
+        // when we cannot reach the machine again. Stale metadata makes it
+        // restore the wrong bytes, or claim there is nothing to restore.
+        let restored = rollback(&dest, DEFAULT_KEEP).await.expect("rollback failed");
+
+        assert_eq!(read(&dest), "good");
+        assert_eq!(restored.checksum, compute_checksum(b"good"));
+    }
+
+    #[tokio::test]
+    async fn a_plain_file_with_no_history_stays_unversioned() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("config.toml");
+
+        assert!(!should_version(&dest, 0o644), "a fresh non-executable path must not be versioned");
+
+        deploy(&dest, "key = 1", 0o644).await;
+        deploy(&dest, "key = 2", 0o644).await;
+
+        assert_eq!(read(&dest), "key = 2");
+        assert!(
+            !store_dir(&dest).exists(),
+            "config files must not grow a sidecar they never needed"
+        );
+    }
+
+    #[test]
+    fn executables_are_versioned_even_with_no_history() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(should_version(&dir.path().join("fresh-binary"), 0o755));
     }
 }
